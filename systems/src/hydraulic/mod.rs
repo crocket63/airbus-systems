@@ -8,7 +8,7 @@ use uom::{si::{acceleration::galileo, area::square_meter, f64::*, force::newton,
 
 use crate::{
     overhead::{NormalAltnPushButton, OnOffPushButton},
-    shared::Engine,
+    engine::Engine,
     simulator::UpdateContext,
 };
 
@@ -1200,7 +1200,7 @@ mod tests {
     }
 
     fn engine(n2: Ratio) -> Engine {
-        let mut engine = Engine::new();
+        let mut engine = Engine::new(1);
         engine.n2 = n2;
 
         engine
