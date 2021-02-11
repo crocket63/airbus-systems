@@ -6,7 +6,7 @@ use uom::si::{
     volume::cubic_inch, volume::gallon, volume::liter, volume_rate::cubic_meter_per_second,
     volume_rate::gallon_per_second,
 };
-use crate::{hydraulic::{ElectricPump, EngineDrivenPump, HydFluid, HydLoop, LoopColor, Pump, RatPump, Ptu},engine::Engine, overhead::{AutoOffPushButton, NormalAltnPushButton, OnOffPushButton}, shared::DelayedTrueLogicGate, simulator::UpdateContext};
+use crate::{engine::Engine, hydraulic::{ElectricPump, EngineDrivenPump, HydFluid, HydLoop, LoopColor, PressureSource, Ptu, Pump, RatPump}, overhead::{AutoOffPushButton, NormalAltnPushButton, OnOffPushButton}, shared::DelayedTrueLogicGate, simulator::UpdateContext};
 
 pub struct A320Hydraulic {
     blue_loop: HydLoop,
@@ -19,6 +19,7 @@ pub struct A320Hydraulic {
     ptu: Ptu,
     total_sim_time_elapsed: Duration,
     lag_time_accumulator: Duration,
+    debug_refresh_duration: Duration,
     // Until hydraulic is implemented, we'll fake it with this boolean.
     // blue_pressurised: bool,
 }
@@ -68,6 +69,7 @@ impl A320Hydraulic {
             ptu : Ptu::new(),
             total_sim_time_elapsed: Duration::new(0,0),
             lag_time_accumulator: Duration::new(0,0),
+            debug_refresh_duration: Duration::new(0,0),
         }
     }
 
@@ -87,26 +89,39 @@ impl A320Hydraulic {
 
         let min_hyd_loop_timestep = Duration::from_millis(A320Hydraulic::HYDRAULIC_SIM_TIME_STEP); //Hyd Sim rate = 10 Hz
 
-        //time to catch up in our simulation
+
         self.total_sim_time_elapsed += ct.delta;
 
-        let time_to_catch=self.total_sim_time_elapsed + self.lag_time_accumulator;
+
+        //time to catch up in our simulation = new delta + time not updated last iteration
+        let time_to_catch=ct.delta + self.lag_time_accumulator;
 
 
         //Number of time steps to do according to required time step
-        let numberOfSteps_f64 = time_to_catch.as_secs_f64()/min_hyd_loop_timestep.as_secs_f64();
+        let number_of_steps_f64 = time_to_catch.as_secs_f64()/min_hyd_loop_timestep.as_secs_f64();
 
-        if numberOfSteps_f64 < 1.0 {
+        self.debug_refresh_duration+=ct.delta;
+        if self.debug_refresh_duration > Duration::from_secs_f64(0.3) {
+            // println!("---HYDRAULIC UPDATE : t={}", self.total_sim_time_elapsed.as_secs_f64());
+            // println!("---G: {:.0} B: {:.0} Y: {:.0}", self.green_loop.get_pressure().get::<psi>(),self.blue_loop.get_pressure().get::<psi>(),self.yellow_loop.get_pressure().get::<psi>());
+            // println!("---EDP1 n2={} EDP2 n2={}", engine1.n2.get::<percent>(), engine2.n2.get::<percent>());
+            // println!("---EDP1 flowMax={:.1}gpm EDP2 flowMax={:.1}gpm", (self.engine_driven_pump_1.get_delta_vol_max().get::<gallon>() / min_hyd_loop_timestep.as_secs_f64() )* 60.0, (self.engine_driven_pump_2.get_delta_vol_max().get::<gallon>()/min_hyd_loop_timestep.as_secs_f64())*60.0);
+
+            //println!("---steps required: {:.2}", number_of_steps_f64);
+            self.debug_refresh_duration= Duration::from_secs_f64(0.0);
+        }
+
+        if number_of_steps_f64 < 1.0 {
             //Can't do a full time step
             //we can either do an update with smaller step or wait next iteration
             //Other option is to update only actuator position based on known hydraulic
             //state to avoid lag of control surfaces if sim runs really fast
-            self.lag_time_accumulator=Duration::from_secs_f64(numberOfSteps_f64 * min_hyd_loop_timestep.as_secs_f64()); //Time lag is float part of num of steps * fixed time step to get a result in time
+            self.lag_time_accumulator=Duration::from_secs_f64(number_of_steps_f64 * min_hyd_loop_timestep.as_secs_f64()); //Time lag is float part of num of steps * fixed time step to get a result in time
         } else {
             //TRUE UPDATE LOOP HERE
-            let num_of_update_loops = numberOfSteps_f64.floor() as u32; //Int part is the actual number of loops to do
+            let num_of_update_loops = number_of_steps_f64.floor() as u32; //Int part is the actual number of loops to do
             //Rest of floating part goes into accumulator
-            self.lag_time_accumulator= Duration::from_secs_f64((numberOfSteps_f64 - (num_of_update_loops as f64))* min_hyd_loop_timestep.as_secs_f64()); //Keep track of time left after all fixed loop are done
+            self.lag_time_accumulator= Duration::from_secs_f64((number_of_steps_f64 - (num_of_update_loops as f64))* min_hyd_loop_timestep.as_secs_f64()); //Keep track of time left after all fixed loop are done
 
 
             //UPDATING HYDRAULICS AT FIXED STEP
