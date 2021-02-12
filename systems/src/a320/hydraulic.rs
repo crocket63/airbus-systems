@@ -6,7 +6,7 @@ use uom::si::{
     volume::cubic_inch, volume::gallon, volume::liter, volume_rate::cubic_meter_per_second,
     volume_rate::gallon_per_second,
 };
-use crate::{engine::Engine, hydraulic::{ElectricPump, EngineDrivenPump, HydFluid, HydLoop, LoopColor, PressureSource, Ptu, Pump, RatPump}, overhead::{OnOffFaultPushButton}, shared::DelayedTrueLogicGate, simulator::UpdateContext};
+use crate::{engine::Engine, hydraulic::{ElectricPump, EngineDrivenPump, HydFluid, HydLoop, LoopColor, PressureSource, Ptu, Pump, RatPump}, overhead::{AutoOffFaultPushButton,OnOffFaultPushButton}, shared::DelayedTrueLogicGate, simulator::UpdateContext};
 
 pub struct A320Hydraulic {
     blue_loop: HydLoop,
@@ -102,12 +102,12 @@ impl A320Hydraulic {
 
         self.debug_refresh_duration+=ct.delta;
         if self.debug_refresh_duration > Duration::from_secs_f64(0.3) {
-            // println!("---HYDRAULIC UPDATE : t={}", self.total_sim_time_elapsed.as_secs_f64());
-            // println!("---G: {:.0} B: {:.0} Y: {:.0}", self.green_loop.get_pressure().get::<psi>(),self.blue_loop.get_pressure().get::<psi>(),self.yellow_loop.get_pressure().get::<psi>());
-            // println!("---EDP1 n2={} EDP2 n2={}", engine1.n2.get::<percent>(), engine2.n2.get::<percent>());
-            // println!("---EDP1 flowMax={:.1}gpm EDP2 flowMax={:.1}gpm", (self.engine_driven_pump_1.get_delta_vol_max().get::<gallon>() / min_hyd_loop_timestep.as_secs_f64() )* 60.0, (self.engine_driven_pump_2.get_delta_vol_max().get::<gallon>()/min_hyd_loop_timestep.as_secs_f64())*60.0);
+            println!("---HYDRAULIC UPDATE : t={}", self.total_sim_time_elapsed.as_secs_f64());
+            println!("---G: {:.0} B: {:.0} Y: {:.0}", self.green_loop.get_pressure().get::<psi>(),self.blue_loop.get_pressure().get::<psi>(),self.yellow_loop.get_pressure().get::<psi>());
+            println!("---EDP1 n2={} EDP2 n2={}", engine1.n2.get::<percent>(), engine2.n2.get::<percent>());
+            println!("---EDP1 flowMax={:.1}gpm EDP2 flowMax={:.1}gpm", (self.engine_driven_pump_1.get_delta_vol_max().get::<gallon>() / min_hyd_loop_timestep.as_secs_f64() )* 60.0, (self.engine_driven_pump_2.get_delta_vol_max().get::<gallon>()/min_hyd_loop_timestep.as_secs_f64())*60.0);
 
-            //println!("---steps required: {:.2}", number_of_steps_f64);
+            println!("---steps required: {:.2}", number_of_steps_f64);
             self.debug_refresh_duration= Duration::from_secs_f64(0.0);
         }
 
@@ -149,12 +149,23 @@ impl A320Hydraulic {
 }
 
 pub struct A320HydraulicOverheadPanel {
+    pub edp1_push_button: AutoOffFaultPushButton,
+    pub edp2_push_button: AutoOffFaultPushButton,
+    pub blue_epump_push_button: AutoOffFaultPushButton,
+    pub ptu_push_button: AutoOffFaultPushButton,
+    pub rat_push_button: OnOffFaultPushButton,
+    pub yellow_epump_push_button: OnOffFaultPushButton,
 }
 
 impl A320HydraulicOverheadPanel {
     pub fn new() -> A320HydraulicOverheadPanel {
         A320HydraulicOverheadPanel {
-
+            edp1_push_button: AutoOffFaultPushButton::new_auto("HYD_EDP1_SW"),
+            edp2_push_button: AutoOffFaultPushButton::new_auto("HYD_EDP2_SW"),
+            blue_epump_push_button : AutoOffFaultPushButton::new_auto("HYD_BLUE_EPUMP_SW"),
+            ptu_push_button : AutoOffFaultPushButton::new_auto("HYD_PTU_SW"),
+            rat_push_button : OnOffFaultPushButton::new_off("HYD_RAT_SW"),
+            yellow_epump_push_button :OnOffFaultPushButton::new_off("HYD_YELL_EPUMP_SW"),
         }
     }
 
