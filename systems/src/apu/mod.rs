@@ -7,14 +7,14 @@
 use self::{air_intake_flap::AirIntakeFlap, electronic_control_box::ElectronicControlBox};
 use crate::{
     electrical::{Current, ElectricPowerSource, ElectricSource},
-    overhead::{FirePushButton, OnOffPushButton},
+    overhead::{FirePushButton, OnOffAvailablePushButton, OnOffFaultPushButton},
     pneumatic::{BleedAirValve, BleedAirValveState, Valve},
     simulator::{
-        SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorReadState,
-        SimulatorWriteState, UpdateContext,
+        SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorWriter,
+        UpdateContext,
     },
 };
-use uom::si::f64::*;
+use uom::si::{f64::*, ratio::percent, thermodynamic_temperature::degree_celsius};
 
 mod air_intake_flap;
 mod aps3200;
@@ -40,7 +40,7 @@ impl ApuStartContactor {
 impl ElectricSource for ApuStartContactor {
     fn output(&self) -> Current {
         if self.closed {
-            Current::some(ElectricPowerSource::Battery(1))
+            Current::some(ElectricPowerSource::Battery(10))
         } else {
             Current::none()
         }
@@ -97,10 +97,10 @@ pub struct AuxiliaryPowerUnit {
     fuel_pressure_switch: FuelPressureSwitch,
 }
 impl AuxiliaryPowerUnit {
-    pub fn new_aps3200() -> Self {
+    pub fn new_aps3200(number: usize) -> Self {
         AuxiliaryPowerUnit::new(
             Box::new(ShutdownAps3200Turbine::new()),
-            Box::new(Aps3200ApuGenerator::new()),
+            Box::new(Aps3200ApuGenerator::new(number)),
         )
     }
 
@@ -212,13 +212,23 @@ impl AuxiliaryPowerUnit {
     }
 
     #[cfg(test)]
-    fn frequency_within_normal_range(&self) -> bool {
-        self.generator.frequency_within_normal_range()
+    fn get_potential(&self) -> ElectricPotential {
+        self.generator.get_potential()
     }
 
     #[cfg(test)]
     fn potential_within_normal_range(&self) -> bool {
         self.generator.potential_within_normal_range()
+    }
+
+    #[cfg(test)]
+    fn get_frequency(&self) -> Frequency {
+        self.generator.get_frequency()
+    }
+
+    #[cfg(test)]
+    fn frequency_within_normal_range(&self) -> bool {
+        self.generator.frequency_within_normal_range()
     }
 }
 impl ElectricSource for AuxiliaryPowerUnit {
@@ -233,20 +243,37 @@ impl SimulatorElementVisitable for AuxiliaryPowerUnit {
     }
 }
 impl SimulatorElement for AuxiliaryPowerUnit {
-    fn write(&self, state: &mut SimulatorWriteState) {
-        state.apu.air_intake_flap_is_ecam_open = self.air_intake_flap_is_apu_ecam_open();
-        state.apu.air_intake_flap_opened_for = self.get_air_intake_flap_open_amount();
-        state.apu.available = self.is_available();
-        state.apu.bleed_air_valve_open = self.bleed_air_valve_is_open();
-        state.apu.caution_egt = self.get_egt_caution_temperature();
-        state.apu.egt = self.get_egt();
-        state.apu.inoperable = self.is_inoperable();
-        state.apu.is_auto_shutdown = self.is_auto_shutdown();
-        state.apu.is_emergency_shutdown = self.is_emergency_shutdown();
-        state.apu.low_fuel_pressure_fault = self.has_fuel_low_pressure_fault();
-        state.apu.n = self.get_n();
-        state.apu.start_contactor_energized = self.start_contactor_energized();
-        state.apu.warning_egt = self.get_egt_warning_temperature();
+    fn write(&self, state: &mut SimulatorWriter) {
+        state.write_bool(
+            "APU_FLAP_ECAM_OPEN",
+            self.air_intake_flap_is_apu_ecam_open(),
+        );
+        state.write_f64(
+            "APU_FLAP_OPEN_PERCENTAGE",
+            self.get_air_intake_flap_open_amount().get::<percent>(),
+        );
+        state.write_bool("APU_BLEED_AIR_VALVE_OPEN", self.bleed_air_valve_is_open());
+        state.write_f64(
+            "APU_EGT_CAUTION",
+            self.get_egt_caution_temperature().get::<degree_celsius>(),
+        );
+        state.write_f64("APU_EGT", self.get_egt().get::<degree_celsius>());
+        state.write_bool("ECAM_INOP_SYS_APU", self.is_inoperable());
+        state.write_bool("APU_IS_AUTO_SHUTDOWN", self.is_auto_shutdown());
+        state.write_bool("APU_IS_EMERGENCY_SHUTDOWN", self.is_emergency_shutdown());
+        state.write_bool(
+            "APU_LOW_FUEL_PRESSURE_FAULT",
+            self.has_fuel_low_pressure_fault(),
+        );
+        state.write_f64("APU_N", self.get_n().get::<percent>());
+        state.write_bool(
+            "APU_START_CONTACTOR_ENERGIZED",
+            self.start_contactor_energized(),
+        );
+        state.write_f64(
+            "APU_EGT_WARNING",
+            self.get_egt_warning_temperature().get::<degree_celsius>(),
+        );
     }
 }
 impl BleedAirValveState for AuxiliaryPowerUnit {
@@ -280,6 +307,11 @@ pub trait ApuGenerator: ElectricSource + SimulatorElementVisitable + SimulatorEl
     fn update(&mut self, context: &UpdateContext, n: Ratio, is_emergency_shutdown: bool);
     fn frequency_within_normal_range(&self) -> bool;
     fn potential_within_normal_range(&self) -> bool;
+
+    #[cfg(test)]
+    fn get_frequency(&self) -> Frequency;
+    #[cfg(test)]
+    fn get_potential(&self) -> ElectricPotential;
 }
 
 pub struct AuxiliaryPowerUnitFireOverheadPanel {
@@ -288,7 +320,7 @@ pub struct AuxiliaryPowerUnitFireOverheadPanel {
 impl AuxiliaryPowerUnitFireOverheadPanel {
     pub fn new() -> Self {
         AuxiliaryPowerUnitFireOverheadPanel {
-            apu_fire_button: FirePushButton::new(),
+            apu_fire_button: FirePushButton::new("APU"),
         }
     }
 
@@ -298,25 +330,22 @@ impl AuxiliaryPowerUnitFireOverheadPanel {
 }
 impl SimulatorElementVisitable for AuxiliaryPowerUnitFireOverheadPanel {
     fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+        self.apu_fire_button.accept(visitor);
+
         visitor.visit(&mut Box::new(self));
     }
 }
-impl SimulatorElement for AuxiliaryPowerUnitFireOverheadPanel {
-    fn read(&mut self, state: &SimulatorReadState) {
-        self.apu_fire_button
-            .set(state.fire.apu_fire_button_released);
-    }
-}
+impl SimulatorElement for AuxiliaryPowerUnitFireOverheadPanel {}
 
 pub struct AuxiliaryPowerUnitOverheadPanel {
-    pub master: OnOffPushButton,
-    pub start: OnOffPushButton,
+    pub master: OnOffFaultPushButton,
+    pub start: OnOffAvailablePushButton,
 }
 impl AuxiliaryPowerUnitOverheadPanel {
     pub fn new() -> AuxiliaryPowerUnitOverheadPanel {
         AuxiliaryPowerUnitOverheadPanel {
-            master: OnOffPushButton::new_off(),
-            start: OnOffPushButton::new_off(),
+            master: OnOffFaultPushButton::new_off("APU_MASTER_SW"),
+            start: OnOffAvailablePushButton::new_off("APU_START"),
         }
     }
 
@@ -333,6 +362,7 @@ impl AuxiliaryPowerUnitOverheadPanel {
         self.master.set_fault(apu.has_fault());
     }
 
+    #[cfg(test)]
     fn master_has_fault(&self) -> bool {
         self.master.has_fault()
     }
@@ -345,32 +375,25 @@ impl AuxiliaryPowerUnitOverheadPanel {
         self.start.is_on()
     }
 
-    fn start_shows_available(&self) -> bool {
-        self.start.shows_available()
+    #[cfg(test)]
+    fn start_is_available(&self) -> bool {
+        self.start.is_available()
     }
 }
 impl SimulatorElementVisitable for AuxiliaryPowerUnitOverheadPanel {
     fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+        self.master.accept(visitor);
+        self.start.accept(visitor);
+
         visitor.visit(&mut Box::new(self));
     }
 }
-impl SimulatorElement for AuxiliaryPowerUnitOverheadPanel {
-    fn read(&mut self, state: &SimulatorReadState) {
-        self.master.set_on(state.apu.master_sw_pb_on);
-        self.start.set_on(state.apu.start_pb_on);
-    }
-
-    fn write(&self, state: &mut SimulatorWriteState) {
-        state.apu.master_sw_pb_fault = self.master_has_fault();
-        state.apu.start_pb_on = self.start_is_on();
-        state.apu.start_pb_available = self.start_shows_available();
-    }
-}
+impl SimulatorElement for AuxiliaryPowerUnitOverheadPanel {}
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::simulator::{test_helpers::context_with, ModelToSimulatorVisitor};
+    use crate::simulator::test_helpers::context_with;
     use std::time::Duration;
     use uom::si::{length::foot, ratio::percent, thermodynamic_temperature::degree_celsius};
 
@@ -426,25 +449,23 @@ pub mod tests {
         apu: AuxiliaryPowerUnit,
         apu_fire_overhead: AuxiliaryPowerUnitFireOverheadPanel,
         apu_overhead: AuxiliaryPowerUnitOverheadPanel,
-        apu_bleed: OnOffPushButton,
+        apu_bleed: OnOffFaultPushButton,
         ambient_temperature: ThermodynamicTemperature,
         indicated_altitude: Length,
         apu_gen_is_used: bool,
         has_fuel_remaining: bool,
-        write_state: SimulatorWriteState,
     }
     impl AuxiliaryPowerUnitTester {
         fn new() -> Self {
             AuxiliaryPowerUnitTester {
-                apu: AuxiliaryPowerUnit::new_aps3200(),
+                apu: AuxiliaryPowerUnit::new_aps3200(1),
                 apu_fire_overhead: AuxiliaryPowerUnitFireOverheadPanel::new(),
                 apu_overhead: AuxiliaryPowerUnitOverheadPanel::new(),
-                apu_bleed: OnOffPushButton::new_on(),
+                apu_bleed: OnOffFaultPushButton::new_on("TEST"),
                 ambient_temperature: ThermodynamicTemperature::new::<degree_celsius>(0.),
                 indicated_altitude: Length::new::<foot>(5000.),
                 apu_gen_is_used: true,
                 has_fuel_remaining: true,
-                write_state: SimulatorWriteState::default(),
             }
         }
 
@@ -598,10 +619,6 @@ pub mod tests {
 
             self.apu_overhead.update_after_apu(&self.apu);
 
-            let mut visitor = ModelToSimulatorVisitor::new();
-            self.apu.accept(&mut Box::new(&mut visitor));
-            self.write_state = visitor.get_state();
-
             self
         }
 
@@ -659,7 +676,7 @@ pub mod tests {
         }
 
         fn start_shows_available(&self) -> bool {
-            self.apu_overhead.start_shows_available()
+            self.apu_overhead.start_is_available()
         }
 
         fn master_has_fault(&self) -> bool {
@@ -675,11 +692,11 @@ pub mod tests {
         }
 
         pub fn get_potential(&self) -> ElectricPotential {
-            self.write_state.apu.generator.potential
+            self.apu.get_potential()
         }
 
         pub fn get_frequency(&self) -> Frequency {
-            self.write_state.apu.generator.frequency
+            self.apu.get_frequency()
         }
 
         fn start_contactor_energized(&self) -> bool {
@@ -1576,6 +1593,28 @@ pub mod tests {
             );
 
             assert!(!tester.air_intake_flap_is_apu_ecam_open());
+        }
+
+        #[test]
+        fn writes_its_state() {
+            let apu = tester().get_apu();
+            let mut state = SimulatorWriter::new_for_test();
+
+            apu.write(&mut state);
+
+            assert!(state.len_is(12));
+            assert!(state.contains_bool("APU_FLAP_ECAM_OPEN", false));
+            assert!(state.contains_f64("APU_FLAP_OPEN_PERCENTAGE", 0.));
+            assert!(state.contains_bool("APU_BLEED_AIR_VALVE_OPEN", false));
+            assert!(state.contains_f64("APU_EGT_CAUTION", 649.));
+            assert!(state.contains_f64("APU_EGT", 0.));
+            assert!(state.contains_bool("ECAM_INOP_SYS_APU", false));
+            assert!(state.contains_bool("APU_IS_AUTO_SHUTDOWN", false));
+            assert!(state.contains_bool("APU_IS_EMERGENCY_SHUTDOWN", false));
+            assert!(state.contains_bool("APU_LOW_FUEL_PRESSURE_FAULT", false));
+            assert!(state.contains_f64("APU_N", 0.));
+            assert!(state.contains_bool("APU_START_CONTACTOR_ENERGIZED", false));
+            assert!(state.contains_f64("APU_EGT_WARNING", 682.));
         }
     }
 }

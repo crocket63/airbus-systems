@@ -1,9 +1,12 @@
-use super::{Current, ElectricPowerSource, ElectricSource, PowerConsumptionState};
+use super::{
+    Current, ElectricPowerSource, ElectricSource, ElectricalStateWriter, PowerConsumptionState,
+    ProvideFrequency, ProvideLoad, ProvidePotential,
+};
 use crate::{
     engine::Engine,
-    overhead::OnOffPushButton,
+    overhead::{FaultReleasePushButton, OnOffFaultPushButton},
     simulator::{
-        SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorWriteState,
+        SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorWriter,
         UpdateContext,
     },
 };
@@ -14,12 +17,14 @@ use uom::si::{
 };
 
 pub struct EngineGenerator {
+    writer: ElectricalStateWriter,
     number: usize,
     idg: IntegratedDriveGenerator,
 }
 impl EngineGenerator {
     pub fn new(number: usize) -> EngineGenerator {
         EngineGenerator {
+            writer: ElectricalStateWriter::new(&format!("ENG_GEN_{}", number)),
             number,
             idg: IntegratedDriveGenerator::new(),
         }
@@ -29,7 +34,7 @@ impl EngineGenerator {
         &mut self,
         context: &UpdateContext,
         engine: &Engine,
-        idg_push_button: &OnOffPushButton,
+        idg_push_button: &FaultReleasePushButton,
     ) {
         self.idg.update(context, engine, idg_push_button);
     }
@@ -41,6 +46,55 @@ impl ElectricSource for EngineGenerator {
         } else {
             Current::none()
         }
+    }
+}
+impl ProvidePotential for EngineGenerator {
+    fn get_potential(&self) -> ElectricPotential {
+        // TODO: Replace with actual values once calculated.
+        if self.output().is_powered() {
+            ElectricPotential::new::<volt>(115.)
+        } else {
+            ElectricPotential::new::<volt>(0.)
+        }
+    }
+
+    fn get_potential_normal(&self) -> bool {
+        // TODO: Replace with actual values once calculated.
+        if self.output().is_powered() {
+            true
+        } else {
+            false
+        }
+    }
+}
+impl ProvideFrequency for EngineGenerator {
+    fn get_frequency(&self) -> Frequency {
+        // TODO: Replace with actual values once calculated.
+        if self.output().is_powered() {
+            Frequency::new::<hertz>(400.)
+        } else {
+            Frequency::new::<hertz>(0.)
+        }
+    }
+
+    fn get_frequency_normal(&self) -> bool {
+        // TODO: Replace with actual values once calculated.
+        if self.output().is_powered() {
+            true
+        } else {
+            false
+        }
+    }
+}
+impl ProvideLoad for EngineGenerator {
+    fn get_load(&self) -> Ratio {
+        // TODO: Replace with actual values once calculated.
+        Ratio::new::<percent>(0.)
+    }
+
+    fn get_load_normal(&self) -> bool {
+        // TODO: Replace with actual values once calculated.
+        true
     }
 }
 impl SimulatorElementVisitable for EngineGenerator {
@@ -55,34 +109,8 @@ impl SimulatorElement for EngineGenerator {
         // TODO
     }
 
-    fn write(&self, state: &mut SimulatorWriteState) {
-        // TODO: Replace with actual values once calculated.
-        state.electrical.engine_generator[self.number - 1].load = Ratio::new::<percent>(0.);
-        state.electrical.engine_generator[self.number - 1].load_within_normal_range = true;
-        state.electrical.engine_generator[self.number - 1].frequency = if self.output().is_powered()
-        {
-            Frequency::new::<hertz>(400.)
-        } else {
-            Frequency::new::<hertz>(0.)
-        };
-        state.electrical.engine_generator[self.number - 1].frequency_within_normal_range =
-            if self.output().is_powered() {
-                true
-            } else {
-                false
-            };
-        state.electrical.engine_generator[self.number - 1].potential = if self.output().is_powered()
-        {
-            ElectricPotential::new::<volt>(115.)
-        } else {
-            ElectricPotential::new::<volt>(0.)
-        };
-        state.electrical.engine_generator[self.number - 1].potential_within_normal_range =
-            if self.output().is_powered() {
-                true
-            } else {
-                false
-            };
+    fn write(&self, state: &mut SimulatorWriter) {
+        self.writer.write_alternating_with_load(self, state);
     }
 }
 
@@ -108,9 +136,9 @@ impl IntegratedDriveGenerator {
         &mut self,
         context: &UpdateContext,
         engine: &Engine,
-        idg_push_button: &OnOffPushButton,
+        idg_push_button: &FaultReleasePushButton,
     ) {
-        if idg_push_button.is_off() {
+        if idg_push_button.is_released() {
             // The IDG cannot be reconnected.
             self.connected = false;
         }
@@ -236,7 +264,7 @@ mod tests {
     #[cfg(test)]
     mod engine_generator_tests {
         use super::*;
-        use crate::{overhead::OnOffPushButton, simulator::test_helpers::context_with};
+        use crate::simulator::test_helpers::context_with;
         use std::time::Duration;
 
         #[test]
@@ -268,10 +296,26 @@ mod tests {
             generator.update(
                 &context_with().delta(Duration::from_secs(0)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_off(),
+                &FaultReleasePushButton::new_released("TEST"),
             );
 
             assert!(generator.is_unpowered());
+        }
+
+        #[test]
+        fn writes_its_state() {
+            let engine_gen = engine_generator();
+            let mut state = SimulatorWriter::new_for_test();
+
+            engine_gen.write(&mut state);
+
+            assert!(state.len_is(6));
+            assert!(state.contains_f64("ELEC_ENG_GEN_1_POTENTIAL", 0.));
+            assert!(state.contains_bool("ELEC_ENG_GEN_1_POTENTIAL_NORMAL", false));
+            assert!(state.contains_f64("ELEC_ENG_GEN_1_FREQUENCY", 0.));
+            assert!(state.contains_bool("ELEC_ENG_GEN_1_FREQUENCY_NORMAL", false));
+            assert!(state.contains_f64("ELEC_ENG_GEN_1_LOAD", 0.));
+            assert!(state.contains_bool("ELEC_ENG_GEN_1_LOAD_NORMAL", true));
         }
 
         fn engine_generator() -> EngineGenerator {
@@ -282,7 +326,7 @@ mod tests {
             generator.update(
                 &context_with().delta(Duration::from_secs(1)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_on(),
+                &FaultReleasePushButton::new_in("TEST"),
             );
         }
 
@@ -290,7 +334,7 @@ mod tests {
             generator.update(
                 &context_with().delta(Duration::from_secs(1)).build(),
                 &engine_below_threshold(),
-                &OnOffPushButton::new_on(),
+                &FaultReleasePushButton::new_in("TEST"),
             );
         }
     }
@@ -318,7 +362,7 @@ mod tests {
             idg.update(
                 &context_with().delta(Duration::from_millis(500)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_on(),
+                &FaultReleasePushButton::new_in("TEST"),
             );
 
             assert_eq!(idg.provides_stable_power_output(), true);
@@ -330,7 +374,7 @@ mod tests {
             idg.update(
                 &context_with().delta(Duration::from_millis(499)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_on(),
+                &FaultReleasePushButton::new_in("TEST"),
             );
 
             assert_eq!(idg.provides_stable_power_output(), false);
@@ -342,13 +386,13 @@ mod tests {
             idg.update(
                 &context_with().delta(Duration::from_millis(500)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_off(),
+                &FaultReleasePushButton::new_released("TEST"),
             );
 
             idg.update(
                 &context_with().delta(Duration::from_millis(500)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_on(),
+                &FaultReleasePushButton::new_in("TEST"),
             );
 
             assert_eq!(idg.provides_stable_power_output(), false);
@@ -361,7 +405,7 @@ mod tests {
             idg.update(
                 &context_with().delta(Duration::from_secs(10)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_on(),
+                &FaultReleasePushButton::new_in("TEST"),
             );
 
             assert!(idg.oil_outlet_temperature > starting_temperature);
@@ -371,10 +415,11 @@ mod tests {
         fn running_engine_does_not_warm_up_idg_when_disconnected() {
             let mut idg = idg();
             let starting_temperature = idg.oil_outlet_temperature;
+
             idg.update(
                 &context_with().delta(Duration::from_secs(10)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_off(),
+                &FaultReleasePushButton::new_released("TEST"),
             );
 
             assert_eq!(idg.oil_outlet_temperature, starting_temperature);
@@ -386,14 +431,14 @@ mod tests {
             idg.update(
                 &context_with().delta(Duration::from_secs(10)).build(),
                 &engine_above_threshold(),
-                &OnOffPushButton::new_on(),
+                &FaultReleasePushButton::new_in("TEST"),
             );
             let starting_temperature = idg.oil_outlet_temperature;
 
             idg.update(
                 &context_with().delta(Duration::from_secs(10)).build(),
                 &Engine::new(1),
-                &OnOffPushButton::new_on(),
+                &FaultReleasePushButton::new_in("TEST"),
             );
 
             assert!(idg.oil_outlet_temperature < starting_temperature);

@@ -16,6 +16,13 @@ pub use power_consumption::{
 pub use static_inverter::StaticInverter;
 pub use transformer_rectifier::TransformerRectifier;
 
+use crate::simulator::{
+    SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorWriter,
+};
+use uom::si::{
+    electric_current::ampere, electric_potential::volt, f64::*, frequency::hertz, ratio::percent,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ElectricPowerSource {
     EngineGenerator(usize),
@@ -102,9 +109,9 @@ pub trait Powerable {
             if is_battery_1_powered && is_battery_2_powered {
                 self.set_input(Current::some(ElectricPowerSource::Batteries));
             } else if is_battery_1_powered {
-                self.set_input(Current::some(ElectricPowerSource::Battery(1)));
+                self.set_input(Current::some(ElectricPowerSource::Battery(10)));
             } else if is_battery_2_powered {
-                self.set_input(Current::some(ElectricPowerSource::Battery(2)));
+                self.set_input(Current::some(ElectricPowerSource::Battery(11)));
             } else {
                 self.set_input(Current::none());
             }
@@ -125,14 +132,14 @@ enum ContactorState {
 /// Represents a contactor in a electrical power circuit.
 #[derive(Debug)]
 pub struct Contactor {
-    id: String,
+    closed_id: String,
     state: ContactorState,
     input: Current,
 }
 impl Contactor {
-    pub fn new(id: String) -> Contactor {
+    pub fn new(id: &str) -> Contactor {
         Contactor {
-            id,
+            closed_id: format!("ELEC_CONTACTOR_{}_IS_CLOSED", id),
             state: ContactorState::Open,
             input: Current::none(),
         }
@@ -176,6 +183,16 @@ impl ElectricSource for Contactor {
         }
     }
 }
+impl SimulatorElementVisitable for Contactor {
+    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+        visitor.visit(&mut Box::new(self));
+    }
+}
+impl SimulatorElement for Contactor {
+    fn write(&self, state: &mut SimulatorWriter) {
+        state.write_bool(&self.closed_id, self.is_closed());
+    }
+}
 
 pub fn combine_electric_sources<T: ElectricSource>(sources: Vec<&T>) -> CombinedElectricSource {
     CombinedElectricSource::new(sources)
@@ -213,14 +230,31 @@ pub enum ElectricalBusType {
     DirectCurrentBattery,
     DirectCurrentHot(u8),
 }
+impl ElectricalBusType {
+    fn get_name(&self) -> String {
+        match self {
+            ElectricalBusType::AlternatingCurrent(number) => format!("AC_{}", number),
+            ElectricalBusType::AlternatingCurrentEssential => String::from("AC_ESS"),
+            ElectricalBusType::AlternatingCurrentEssentialShed => String::from("AC_ESS_SHED"),
+            ElectricalBusType::AlternatingCurrentStaticInverter => String::from("AC_STAT_INV"),
+            ElectricalBusType::DirectCurrent(number) => format!("DC_{}", number),
+            ElectricalBusType::DirectCurrentEssential => String::from("DC_ESS"),
+            ElectricalBusType::DirectCurrentEssentialShed => String::from("DC_ESS_SHED"),
+            ElectricalBusType::DirectCurrentBattery => String::from("DC_BAT"),
+            ElectricalBusType::DirectCurrentHot(number) => format!("DC_HOT_{}", number),
+        }
+    }
+}
 
 pub struct ElectricalBus {
+    bus_powered_id: String,
     input: Current,
     bus_type: ElectricalBusType,
 }
 impl ElectricalBus {
     pub fn new(bus_type: ElectricalBusType) -> ElectricalBus {
         ElectricalBus {
+            bus_powered_id: format!("ELEC_{}_BUS_IS_POWERED", bus_type.get_name()),
             input: Current::none(),
             bus_type,
         }
@@ -248,9 +282,113 @@ impl ElectricSource for ElectricalBus {
         self.input
     }
 }
+impl SimulatorElementVisitable for ElectricalBus {
+    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+        visitor.visit(&mut Box::new(self));
+    }
+}
+impl SimulatorElement for ElectricalBus {
+    fn write(&self, state: &mut SimulatorWriter) {
+        state.write_bool(&self.bus_powered_id, self.is_powered());
+    }
+}
+
+pub struct ElectricalStateWriter {
+    current_id: String,
+    current_normal_id: String,
+    potential_id: String,
+    potential_normal_id: String,
+    frequency_id: String,
+    frequency_normal_id: String,
+    load_id: String,
+    load_normal_id: String,
+}
+impl ElectricalStateWriter {
+    pub fn new(element_id: &str) -> Self {
+        Self {
+            current_id: format!("ELEC_{}_CURRENT", element_id),
+            current_normal_id: format!("ELEC_{}_CURRENT_NORMAL", element_id),
+            potential_id: format!("ELEC_{}_POTENTIAL", element_id),
+            potential_normal_id: format!("ELEC_{}_POTENTIAL_NORMAL", element_id),
+            frequency_id: format!("ELEC_{}_FREQUENCY", element_id),
+            frequency_normal_id: format!("ELEC_{}_FREQUENCY_NORMAL", element_id),
+            load_id: format!("ELEC_{}_LOAD", element_id),
+            load_normal_id: format!("ELEC_{}_LOAD_NORMAL", element_id),
+        }
+    }
+
+    pub fn write_direct<T: ProvideCurrent + ProvidePotential>(
+        &self,
+        source: &T,
+        state: &mut SimulatorWriter,
+    ) {
+        self.write_current(source, state);
+        self.write_potential(source, state);
+    }
+
+    pub fn write_alternating<T: ProvidePotential + ProvideFrequency>(
+        &self,
+        source: &T,
+        state: &mut SimulatorWriter,
+    ) {
+        self.write_potential(source, state);
+        self.write_frequency(source, state);
+    }
+
+    pub fn write_alternating_with_load<T: ProvidePotential + ProvideFrequency + ProvideLoad>(
+        &self,
+        source: &T,
+        state: &mut SimulatorWriter,
+    ) {
+        self.write_alternating(source, state);
+        self.write_load(source, state);
+    }
+
+    fn write_current<T: ProvideCurrent>(&self, source: &T, state: &mut SimulatorWriter) {
+        state.write_f64(&self.current_id, source.get_current().get::<ampere>());
+        state.write_bool(&self.current_normal_id, source.get_current_normal());
+    }
+
+    fn write_potential<T: ProvidePotential>(&self, source: &T, state: &mut SimulatorWriter) {
+        state.write_f64(&self.potential_id, source.get_potential().get::<volt>());
+        state.write_bool(&self.potential_normal_id, source.get_potential_normal());
+    }
+
+    fn write_frequency<T: ProvideFrequency>(&self, source: &T, state: &mut SimulatorWriter) {
+        state.write_f64(&self.frequency_id, source.get_frequency().get::<hertz>());
+        state.write_bool(&self.frequency_normal_id, source.get_frequency_normal());
+    }
+
+    fn write_load<T: ProvideLoad>(&self, source: &T, state: &mut SimulatorWriter) {
+        state.write_f64(&self.load_id, source.get_load().get::<percent>());
+        state.write_bool(&self.load_normal_id, source.get_load_normal());
+    }
+}
+
+pub trait ProvideCurrent {
+    fn get_current(&self) -> ElectricCurrent;
+    fn get_current_normal(&self) -> bool;
+}
+
+pub trait ProvidePotential {
+    fn get_potential(&self) -> ElectricPotential;
+    fn get_potential_normal(&self) -> bool;
+}
+
+pub trait ProvideFrequency {
+    fn get_frequency(&self) -> Frequency;
+    fn get_frequency_normal(&self) -> bool;
+}
+
+pub trait ProvideLoad {
+    fn get_load(&self) -> Ratio;
+    fn get_load_normal(&self) -> bool;
+}
 
 #[cfg(test)]
 mod tests {
+    use uom::si::frequency::hertz;
+
     use super::*;
     struct Powerless {}
     impl ElectricSource for Powerless {
@@ -263,6 +401,44 @@ mod tests {
     impl ElectricSource for StubApuGenerator {
         fn output(&self) -> Current {
             Current::some(ElectricPowerSource::ApuGenerator)
+        }
+    }
+
+    struct StubElectricSource {}
+    impl ProvideCurrent for StubElectricSource {
+        fn get_current(&self) -> ElectricCurrent {
+            ElectricCurrent::new::<ampere>(150.)
+        }
+
+        fn get_current_normal(&self) -> bool {
+            true
+        }
+    }
+    impl ProvidePotential for StubElectricSource {
+        fn get_potential(&self) -> ElectricPotential {
+            ElectricPotential::new::<volt>(28.)
+        }
+
+        fn get_potential_normal(&self) -> bool {
+            true
+        }
+    }
+    impl ProvideFrequency for StubElectricSource {
+        fn get_frequency(&self) -> Frequency {
+            Frequency::new::<hertz>(400.)
+        }
+
+        fn get_frequency_normal(&self) -> bool {
+            true
+        }
+    }
+    impl ProvideLoad for StubElectricSource {
+        fn get_load(&self) -> Ratio {
+            Ratio::new::<percent>(50.)
+        }
+
+        fn get_load_normal(&self) -> bool {
+            true
         }
     }
 
@@ -308,18 +484,18 @@ mod tests {
 
         #[test]
         fn or_powered_by_both_batteries_results_in_both_when_both_connected() {
-            let bat_1 = BatteryStub::new(Current::some(ElectricPowerSource::Battery(1)));
-            let bat_2 = BatteryStub::new(Current::some(ElectricPowerSource::Battery(2)));
+            let bat_1 = BatteryStub::new(Current::some(ElectricPowerSource::Battery(10)));
+            let bat_2 = BatteryStub::new(Current::some(ElectricPowerSource::Battery(11)));
 
             let expected = Current::some(ElectricPowerSource::Batteries);
 
             let mut powerable = PowerableUnderTest::new();
 
-            let mut contactor_1 = Contactor::new(String::from("BAT1"));
+            let mut contactor_1 = Contactor::new("BAT1");
             contactor_1.powered_by(&bat_1);
             contactor_1.close_when(true);
 
-            let mut contactor_2 = Contactor::new(String::from("BAT2"));
+            let mut contactor_2 = Contactor::new("BAT2");
             contactor_2.powered_by(&bat_2);
             contactor_2.close_when(true);
 
@@ -330,7 +506,7 @@ mod tests {
 
         #[test]
         fn or_powered_by_battery_1_results_in_bat_1_output() {
-            let expected = Current::some(ElectricPowerSource::Battery(1));
+            let expected = Current::some(ElectricPowerSource::Battery(10));
 
             let bat_1 = BatteryStub::new(expected);
             let bat_2 = BatteryStub::new(Current::none());
@@ -340,7 +516,7 @@ mod tests {
 
         #[test]
         fn or_powered_by_battery_2_results_in_bat_2_output() {
-            let expected = Current::some(ElectricPowerSource::Battery(2));
+            let expected = Current::some(ElectricPowerSource::Battery(11));
 
             let bat_1 = BatteryStub::new(Current::none());
             let bat_2 = BatteryStub::new(expected);
@@ -355,11 +531,11 @@ mod tests {
         ) {
             let mut powerable = PowerableUnderTest::new();
 
-            let mut contactor_1 = Contactor::new(String::from("BAT1"));
+            let mut contactor_1 = Contactor::new("BAT1");
             contactor_1.powered_by(&bat_1);
             contactor_1.close_when(true);
 
-            let mut contactor_2 = Contactor::new(String::from("BAT2"));
+            let mut contactor_2 = Contactor::new("BAT2");
             contactor_2.powered_by(&bat_2);
             contactor_2.close_when(true);
 
@@ -399,6 +575,62 @@ mod tests {
 
         fn none_current() -> Current {
             Current::none()
+        }
+    }
+
+    #[cfg(test)]
+    mod electrical_bus_type_tests {
+        use crate::electrical::ElectricalBusType;
+
+        #[test]
+        fn get_name_returns_name() {
+            assert_eq!(ElectricalBusType::AlternatingCurrent(2).get_name(), "AC_2");
+            assert_eq!(
+                ElectricalBusType::AlternatingCurrentEssential.get_name(),
+                "AC_ESS"
+            );
+            assert_eq!(
+                ElectricalBusType::AlternatingCurrentEssentialShed.get_name(),
+                "AC_ESS_SHED"
+            );
+            assert_eq!(
+                ElectricalBusType::AlternatingCurrentStaticInverter.get_name(),
+                "AC_STAT_INV"
+            );
+            assert_eq!(ElectricalBusType::DirectCurrent(2).get_name(), "DC_2");
+            assert_eq!(
+                ElectricalBusType::DirectCurrentEssential.get_name(),
+                "DC_ESS"
+            );
+            assert_eq!(
+                ElectricalBusType::DirectCurrentEssentialShed.get_name(),
+                "DC_ESS_SHED"
+            );
+            assert_eq!(ElectricalBusType::DirectCurrentBattery.get_name(), "DC_BAT");
+            assert_eq!(
+                ElectricalBusType::DirectCurrentHot(2).get_name(),
+                "DC_HOT_2"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod electrical_bus_tests {
+        use super::*;
+
+        #[test]
+        fn writes_its_state() {
+            let bus = electrical_bus();
+            let mut state = SimulatorWriter::new_for_test();
+
+            bus.write(&mut state);
+
+            assert!(state.len_is(1));
+            assert!(state.contains_bool("ELEC_AC_2_BUS_IS_POWERED", false));
+        }
+
+        fn electrical_bus() -> ElectricalBus {
+            ElectricalBus::new(ElectricalBusType::AlternatingCurrent(2))
         }
     }
 
@@ -493,8 +725,19 @@ mod tests {
             assert!(contactor.is_powered());
         }
 
+        #[test]
+        fn writes_its_state() {
+            let contactor = contactor();
+            let mut state = SimulatorWriter::new_for_test();
+
+            contactor.write(&mut state);
+
+            assert!(state.len_is(1));
+            assert!(state.contains_bool("ELEC_CONTACTOR_TEST_IS_CLOSED", false));
+        }
+
         fn contactor() -> Contactor {
-            Contactor::new(String::from("TEST"))
+            Contactor::new("TEST")
         }
 
         fn open_contactor() -> Contactor {
@@ -509,6 +752,55 @@ mod tests {
             contactor.state = ContactorState::Closed;
 
             contactor
+        }
+    }
+
+    #[cfg(test)]
+    mod current_state_writer_tests {
+        use super::*;
+
+        #[test]
+        fn writes_direct_current_state() {
+            let writer = ElectricalStateWriter::new("BAT_2");
+            let mut state = SimulatorWriter::new_for_test();
+
+            writer.write_direct(&StubElectricSource {}, &mut state);
+
+            assert!(state.len_is(4));
+            assert!(state.contains_f64("ELEC_BAT_2_CURRENT", 150.));
+            assert!(state.contains_bool("ELEC_BAT_2_CURRENT_NORMAL", true));
+            assert!(state.contains_f64("ELEC_BAT_2_POTENTIAL", 28.));
+            assert!(state.contains_bool("ELEC_BAT_2_POTENTIAL_NORMAL", true));
+        }
+
+        #[test]
+        fn writes_alternating_current_state() {
+            let writer = ElectricalStateWriter::new("APU_GEN");
+            let mut state = SimulatorWriter::new_for_test();
+
+            writer.write_alternating(&StubElectricSource {}, &mut state);
+
+            assert!(state.len_is(4));
+            assert!(state.contains_f64("ELEC_APU_GEN_POTENTIAL", 28.));
+            assert!(state.contains_bool("ELEC_APU_GEN_POTENTIAL_NORMAL", true));
+            assert!(state.contains_f64("ELEC_APU_GEN_FREQUENCY", 400.));
+            assert!(state.contains_bool("ELEC_APU_GEN_FREQUENCY_NORMAL", true));
+        }
+
+        #[test]
+        fn writes_alternating_current_with_load_state() {
+            let writer = ElectricalStateWriter::new("APU_GEN");
+            let mut state = SimulatorWriter::new_for_test();
+
+            writer.write_alternating_with_load(&StubElectricSource {}, &mut state);
+
+            assert!(state.len_is(6));
+            assert!(state.contains_f64("ELEC_APU_GEN_POTENTIAL", 28.));
+            assert!(state.contains_bool("ELEC_APU_GEN_POTENTIAL_NORMAL", true));
+            assert!(state.contains_f64("ELEC_APU_GEN_FREQUENCY", 400.));
+            assert!(state.contains_bool("ELEC_APU_GEN_FREQUENCY_NORMAL", true));
+            assert!(state.contains_f64("ELEC_APU_GEN_LOAD", 50.));
+            assert!(state.contains_bool("ELEC_APU_GEN_LOAD_NORMAL", true));
         }
     }
 }
