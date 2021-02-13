@@ -34,6 +34,7 @@ pub struct A320 {
     electrical: A320Electrical,
     ext_pwr: ExternalPowerSource,
     hydraulic: A320Hydraulic,
+    hydraulic_overhead: A320HydraulicOverheadPanel,
 }
 impl A320 {
     pub fn new() -> A320 {
@@ -49,6 +50,7 @@ impl A320 {
             electrical: A320Electrical::new(),
             ext_pwr: ExternalPowerSource::new(),
             hydraulic: A320Hydraulic::new(),
+            hydraulic_overhead: A320HydraulicOverheadPanel::new(),
         }
     }
 }

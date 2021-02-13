@@ -7,7 +7,9 @@ use uom::si::{
     volume_rate::gallon_per_second,
 };
 use crate::{engine::Engine, hydraulic::{ElectricPump, EngineDrivenPump, HydFluid, HydLoop, LoopColor, PressureSource, Ptu, Pump, RatPump}, overhead::{AutoOffFaultPushButton,OnOffFaultPushButton}, shared::DelayedTrueLogicGate, simulator::UpdateContext};
-
+use crate::simulator::{
+    SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorReader,
+};
 pub struct A320Hydraulic {
     blue_loop: HydLoop,
     green_loop: HydLoop,
@@ -172,3 +174,17 @@ impl A320HydraulicOverheadPanel {
     pub fn update(&mut self, context: &UpdateContext) {
     }
 }
+
+impl SimulatorElementVisitable for A320HydraulicOverheadPanel {
+    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+        self.edp1_push_button.accept(visitor);
+        self.edp2_push_button.accept(visitor);
+        self.blue_epump_push_button.accept(visitor);
+        self.ptu_push_button.accept(visitor);
+        self.rat_push_button.accept(visitor);
+        self.yellow_epump_push_button.accept(visitor);
+
+        visitor.visit(&mut Box::new(self));
+    }
+}
+impl SimulatorElement for A320HydraulicOverheadPanel {}
