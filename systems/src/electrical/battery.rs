@@ -65,7 +65,7 @@ impl ProvideCurrent for Battery {
     fn get_current(&self) -> ElectricCurrent {
         // TODO: Replace with actual values once calculated.
         if self.output().is_powered() {
-            ElectricCurrent::new::<ampere>(150.)
+            ElectricCurrent::new::<ampere>(0.)
         } else {
             ElectricCurrent::new::<ampere>(0.)
         }
@@ -189,7 +189,7 @@ mod battery_tests {
         bus.write(&mut state);
 
         assert!(state.len_is(4));
-        assert!(state.contains_f64("ELEC_BAT_1_CURRENT", 150.));
+        assert!(state.contains_f64("ELEC_BAT_1_CURRENT", 0.));
         assert!(state.contains_bool("ELEC_BAT_1_CURRENT_NORMAL", true));
         assert!(state.contains_f64("ELEC_BAT_1_POTENTIAL", 28.));
         assert!(state.contains_bool("ELEC_BAT_1_POTENTIAL_NORMAL", true));

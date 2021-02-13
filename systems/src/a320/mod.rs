@@ -88,6 +88,7 @@ impl Aircraft for A320 {
             &self.hydraulic,
             &self.electrical_overhead,
         );
+        self.electrical_overhead.update_after_elec(&self.electrical);
 
         self.hydraulic.update(
             context,
