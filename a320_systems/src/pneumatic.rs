@@ -1,7 +1,7 @@
-use crate::{
+use systems::{
     overhead::OnOffFaultPushButton,
     pneumatic::BleedAirValveState,
-    simulator::{SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor},
+    simulation::{SimulationElement, SimulationElementVisitor},
 };
 
 pub struct A320PneumaticOverheadPanel {
@@ -28,22 +28,18 @@ impl A320PneumaticOverheadPanel {
         self.apu_bleed.has_fault()
     }
 }
-impl SimulatorElementVisitable for A320PneumaticOverheadPanel {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+impl SimulationElement for A320PneumaticOverheadPanel {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
         self.apu_bleed.accept(visitor);
 
-        visitor.visit(&mut Box::new(self));
+        visitor.visit(self);
     }
 }
-impl SimulatorElement for A320PneumaticOverheadPanel {}
 
 #[cfg(test)]
 pub mod tests {
     use super::A320PneumaticOverheadPanel;
-    use crate::{
-        pneumatic::BleedAirValveState,
-        simulator::{SimulatorElement, SimulatorWriter},
-    };
+    use crate::pneumatic::BleedAirValveState;
 
     fn overhead() -> A320PneumaticOverheadPanel {
         A320PneumaticOverheadPanel::new()
@@ -70,7 +66,7 @@ pub mod tests {
     #[test]
     fn when_apu_bleed_on_and_valve_is_closed_fault_is_shown() {
         let mut overhead = overhead();
-        overhead.apu_bleed.turn_on();
+        overhead.apu_bleed.push_on();
 
         overhead.update_after_apu(&bleed_air_valve_state(false));
 
@@ -80,7 +76,7 @@ pub mod tests {
     #[test]
     fn when_apu_bleed_on_and_valve_is_open_fault_is_not_shown() {
         let mut overhead = overhead();
-        overhead.apu_bleed.turn_on();
+        overhead.apu_bleed.push_on();
 
         overhead.update_after_apu(&bleed_air_valve_state(true));
 
@@ -90,7 +86,7 @@ pub mod tests {
     #[test]
     fn when_apu_bleed_off_and_valve_is_open_fault_is_shown() {
         let mut overhead = overhead();
-        overhead.apu_bleed.turn_off();
+        overhead.apu_bleed.push_off();
 
         overhead.update_after_apu(&bleed_air_valve_state(true));
 
@@ -100,7 +96,7 @@ pub mod tests {
     #[test]
     fn when_apu_bleed_off_and_valve_is_closed_fault_is_not_shown() {
         let mut overhead = overhead();
-        overhead.apu_bleed.turn_off();
+        overhead.apu_bleed.push_off();
 
         overhead.update_after_apu(&bleed_air_valve_state(false));
 

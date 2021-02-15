@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use super::{ElectricPowerSource, ElectricalBus, ElectricalBusType};
-use crate::simulator::{SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor};
+use super::{ElectricalBus, ElectricalBusType, Potential, PotentialSource};
+use crate::simulation::{SimulationElement, SimulationElementVisitor};
 use uom::si::{f64::*, power::watt};
 
 pub struct SupplyPowerVisitor<'a> {
@@ -12,8 +12,8 @@ impl<'a> SupplyPowerVisitor<'a> {
         SupplyPowerVisitor { supply }
     }
 }
-impl<'a> SimulatorElementVisitor for SupplyPowerVisitor<'a> {
-    fn visit(&mut self, visited: &mut Box<&mut dyn SimulatorElement>) {
+impl<'a> SimulationElementVisitor for SupplyPowerVisitor<'a> {
+    fn visit<T: SimulationElement>(&mut self, visited: &mut T) {
         visited.supply_power(&self.supply);
     }
 }
@@ -26,8 +26,8 @@ impl<'a, 'b> DeterminePowerConsumptionVisitor<'a, 'b> {
         DeterminePowerConsumptionVisitor { state }
     }
 }
-impl<'a, 'b> SimulatorElementVisitor for DeterminePowerConsumptionVisitor<'a, 'b> {
-    fn visit(&mut self, visited: &mut Box<&mut dyn SimulatorElement>) {
+impl<'a, 'b> SimulationElementVisitor for DeterminePowerConsumptionVisitor<'a, 'b> {
+    fn visit<T: SimulationElement>(&mut self, visited: &mut T) {
         visited.determine_power_consumption(&mut self.state);
     }
 }
@@ -40,15 +40,15 @@ impl<'a> WritePowerConsumptionVisitor<'a> {
         WritePowerConsumptionVisitor { state }
     }
 }
-impl<'a> SimulatorElementVisitor for WritePowerConsumptionVisitor<'a> {
-    fn visit(&mut self, visited: &mut Box<&mut dyn SimulatorElement>) {
+impl<'a> SimulationElementVisitor for WritePowerConsumptionVisitor<'a> {
+    fn visit<T: SimulationElement>(&mut self, visited: &mut T) {
         visited.write_power_consumption(&self.state);
     }
 }
 
 pub struct PowerConsumptionState<'a> {
     supply: &'a PowerSupply,
-    consumption: HashMap<ElectricPowerSource, Power>,
+    consumption: HashMap<Potential, Power>,
 }
 impl<'a> PowerConsumptionState<'a> {
     pub fn new(supply: &'a PowerSupply) -> Self {
@@ -59,21 +59,21 @@ impl<'a> PowerConsumptionState<'a> {
     }
 
     pub fn add(&mut self, bus_type: &ElectricalBusType, power: Power) {
-        match self.supply.get_source_for(bus_type) {
-            Some(source) => {
-                let existing_power = match self.consumption.get(source) {
+        match self.supply.source_for(bus_type) {
+            Potential::None => {}
+            potential => {
+                let existing_power = match self.consumption.get(&potential) {
                     Some(power) => *power,
                     None => Power::new::<watt>(0.),
                 };
 
-                self.consumption.insert(*source, existing_power + power);
+                self.consumption.insert(potential, existing_power + power);
             }
-            None => {}
         };
     }
 
-    pub fn get_total_consumption_for(&self, source: &ElectricPowerSource) -> Power {
-        match self.consumption.get(source) {
+    pub fn total_consumption_for(&self, potential: &Potential) -> Power {
+        match self.consumption.get(potential) {
             Some(power) => *power,
             None => Power::new::<watt>(0.),
         }
@@ -82,7 +82,7 @@ impl<'a> PowerConsumptionState<'a> {
 
 #[derive(Debug)]
 pub struct PowerSupply {
-    state: HashMap<ElectricalBusType, Option<ElectricPowerSource>>,
+    state: HashMap<ElectricalBusType, Potential>,
 }
 impl PowerSupply {
     pub fn new() -> PowerSupply {
@@ -92,20 +92,20 @@ impl PowerSupply {
     }
 
     pub fn add(&mut self, bus: &ElectricalBus) {
-        self.state.insert(bus.get_type(), bus.get_power_source());
+        self.state.insert(bus.bus_type(), bus.output_potential());
     }
 
     pub fn is_powered(&self, bus_type: &ElectricalBusType) -> bool {
         match self.state.get(bus_type) {
-            Some(source) => source.is_some(),
+            Some(source) => source.is_powered(),
             None => false,
         }
     }
 
-    pub fn get_source_for(&self, bus_type: &ElectricalBusType) -> &Option<ElectricPowerSource> {
+    pub fn source_for(&self, bus_type: &ElectricalBusType) -> Potential {
         match self.state.get(bus_type) {
-            Some(source) => source,
-            None => &None,
+            Some(source) => *source,
+            None => Potential::None,
         }
     }
 }
@@ -121,6 +121,7 @@ pub struct PowerConsumption {
     powered_by: Vec<ElectricalBusType>,
 }
 impl PowerConsumption {
+    #[cfg(test)]
     pub fn from_single(bus_type: ElectricalBusType) -> Self {
         PowerConsumption {
             is_powered_by: None,
@@ -129,10 +130,12 @@ impl PowerConsumption {
         }
     }
 
+    #[cfg(test)]
     pub fn is_powered(&self) -> bool {
         self.is_powered_by.is_some()
     }
 
+    #[cfg(test)]
     pub fn demand(&mut self, power: Power) {
         self.power_demand = power;
     }
@@ -158,12 +161,7 @@ impl PowerConsumption {
         }
     }
 }
-impl SimulatorElementVisitable for PowerConsumption {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
-        visitor.visit(&mut Box::new(self));
-    }
-}
-impl SimulatorElement for PowerConsumption {
+impl SimulationElement for PowerConsumption {
     fn supply_power(&mut self, supply: &PowerSupply) {
         self.try_powering(supply);
     }
@@ -188,35 +186,26 @@ impl<'a> PowerConsumptionHandler<'a> {
         }
     }
 
-    pub fn supply_power_to_elements(
-        &self,
-        visitable: &mut Box<&mut dyn SimulatorElementVisitable>,
-    ) {
+    pub fn supply_power_to_elements<T: SimulationElement>(&self, element: &mut T) {
         let mut visitor = SupplyPowerVisitor::new(&self.supply);
-        visitable.accept(&mut Box::new(&mut visitor));
+        element.accept(&mut visitor);
     }
 
-    pub fn determine_power_consumption(
-        &mut self,
-        visitable: &mut Box<&mut dyn SimulatorElementVisitable>,
-    ) {
+    pub fn determine_power_consumption<T: SimulationElement>(&mut self, element: &mut T) {
         let mut visitor = DeterminePowerConsumptionVisitor::new(&mut self.power_consumption_state);
-        visitable.accept(&mut Box::new(&mut visitor));
+        element.accept(&mut visitor);
     }
 
-    pub fn write_power_consumption(
-        &mut self,
-        visitable: &mut Box<&mut dyn SimulatorElementVisitable>,
-    ) {
+    pub fn write_power_consumption<T: SimulationElement>(&mut self, element: &mut T) {
         let mut visitor = WritePowerConsumptionVisitor::new(&self.power_consumption_state);
-        visitable.accept(&mut Box::new(&mut visitor));
+        element.accept(&mut visitor);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::electrical::{Current, ElectricSource};
+    use crate::electrical::{Potential, PotentialSource};
 
     struct ApuStub {
         used_power: Power,
@@ -228,25 +217,20 @@ mod tests {
             }
         }
     }
-    impl ElectricSource for ApuStub {
-        fn output(&self) -> Current {
-            Current::some(ElectricPowerSource::ApuGenerator)
+    impl PotentialSource for ApuStub {
+        fn output_potential(&self) -> Potential {
+            Potential::ApuGenerator(1)
         }
     }
-    impl SimulatorElementVisitable for ApuStub {
-        fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
-            visitor.visit(&mut Box::new(self));
-        }
-    }
-    impl SimulatorElement for ApuStub {
+    impl SimulationElement for ApuStub {
         fn write_power_consumption(&mut self, state: &PowerConsumptionState) {
-            self.used_power = state.get_total_consumption_for(&ElectricPowerSource::ApuGenerator);
+            self.used_power = state.total_consumption_for(&Potential::ApuGenerator(1));
         }
     }
 
     #[cfg(test)]
     mod power_supply_tests {
-        use crate::electrical::Powerable;
+        use crate::electrical::PotentialTarget;
 
         use super::*;
 
@@ -291,7 +275,7 @@ mod tests {
     #[cfg(test)]
     mod power_consumption_tests {
         use super::*;
-        use crate::electrical::Powerable;
+        use crate::electrical::PotentialTarget;
 
         fn powered_bus(bus_type: ElectricalBusType) -> ElectricalBus {
             let mut bus = ElectricalBus::new(bus_type);
@@ -368,7 +352,7 @@ mod tests {
 
     #[cfg(test)]
     mod power_consumption_handler_tests {
-        use crate::electrical::Powerable;
+        use crate::electrical::PotentialTarget;
 
         use super::*;
 
@@ -397,16 +381,15 @@ mod tests {
                 }
             }
         }
-        impl SimulatorElementVisitable for AircraftStub {
-            fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+        impl SimulationElement for AircraftStub {
+            fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
                 self.door.accept(visitor);
                 self.light.accept(visitor);
                 self.screen.accept(visitor);
                 self.apu.accept(visitor);
-                visitor.visit(&mut Box::new(self));
+                visitor.visit(self);
             }
         }
-        impl SimulatorElement for AircraftStub {}
         impl ElectricalBusStateFactory for AircraftStub {
             fn create_power_supply(&self) -> PowerSupply {
                 let mut supply = PowerSupply::new();
@@ -434,13 +417,12 @@ mod tests {
                 }
             }
         }
-        impl SimulatorElementVisitable for PowerConsumerStub {
-            fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+        impl SimulationElement for PowerConsumerStub {
+            fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
                 self.power_consumption.accept(visitor);
-                visitor.visit(&mut Box::new(self));
+                visitor.visit(self);
             }
         }
-        impl SimulatorElement for PowerConsumerStub {}
 
         #[test]
         fn used_power_is_correctly_calculated() {
@@ -449,9 +431,9 @@ mod tests {
 
             let mut handler = PowerConsumptionHandler::new(&supply);
 
-            handler.supply_power_to_elements(&mut Box::new(&mut aircraft));
-            handler.determine_power_consumption(&mut Box::new(&mut aircraft));
-            handler.write_power_consumption(&mut Box::new(&mut aircraft));
+            handler.supply_power_to_elements(&mut aircraft);
+            handler.determine_power_consumption(&mut aircraft);
+            handler.write_power_consumption(&mut aircraft);
 
             assert!((aircraft.apu.used_power.get::<watt>() - 600.).abs() < f64::EPSILON);
         }

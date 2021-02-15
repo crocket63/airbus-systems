@@ -1,6 +1,7 @@
 [workspace]
 
 members = [
-    "a320",
+    "a320_systems",
+    "a320_systems_wasm",
     "systems"
 ]

@@ -1,15 +1,18 @@
 [package]
-name = "systems"
+name = "a320_systems_wasm"
 version = "0.1.0"
 authors = ["David Walschots <davidwalschots@users.noreply.github.com>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "systems"
+crate-type = ["cdylib"]
+test = false
+
 [dependencies]
 uom = "0.30.0"
-rand = "0.8.0"
-ntest = "0.7.2"
-msfs = "0.0.1-alpha.2"
-plotlib = "0.5.1"
-rustplotlib = "0.0.4"
+a320_systems = { path = "../a320_systems" }
+systems = { path = "../systems" }
+msfs = { git = "https://github.com/flybywiresim/msfs-rs", branch = "main" }

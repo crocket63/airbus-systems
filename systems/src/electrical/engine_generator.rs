@@ -1,14 +1,11 @@
 use super::{
-    Current, ElectricPowerSource, ElectricSource, ElectricalStateWriter, PowerConsumptionState,
-    ProvideFrequency, ProvideLoad, ProvidePotential,
+    ElectricalStateWriter, Potential, PotentialSource, PowerConsumptionState, ProvideFrequency,
+    ProvideLoad, ProvidePotential,
 };
 use crate::{
     engine::Engine,
-    overhead::{FaultReleasePushButton, OnOffFaultPushButton},
-    simulator::{
-        SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorWriter,
-        UpdateContext,
-    },
+    overhead::FaultReleasePushButton,
+    simulation::{SimulationElement, SimulationElementVisitor, SimulatorWriter, UpdateContext},
 };
 use std::cmp::min;
 use uom::si::{
@@ -26,7 +23,7 @@ impl EngineGenerator {
         EngineGenerator {
             writer: ElectricalStateWriter::new(&format!("ENG_GEN_{}", number)),
             number,
-            idg: IntegratedDriveGenerator::new(),
+            idg: IntegratedDriveGenerator::new(number),
         }
     }
 
@@ -39,28 +36,28 @@ impl EngineGenerator {
         self.idg.update(context, engine, idg_push_button);
     }
 }
-impl ElectricSource for EngineGenerator {
-    fn output(&self) -> Current {
+impl PotentialSource for EngineGenerator {
+    fn output_potential(&self) -> Potential {
         if self.idg.provides_stable_power_output() {
-            Current::some(ElectricPowerSource::EngineGenerator(self.number))
+            Potential::EngineGenerator(self.number)
         } else {
-            Current::none()
+            Potential::None
         }
     }
 }
 impl ProvidePotential for EngineGenerator {
-    fn get_potential(&self) -> ElectricPotential {
+    fn potential(&self) -> ElectricPotential {
         // TODO: Replace with actual values once calculated.
-        if self.output().is_powered() {
+        if self.output_potential().is_powered() {
             ElectricPotential::new::<volt>(115.)
         } else {
             ElectricPotential::new::<volt>(0.)
         }
     }
 
-    fn get_potential_normal(&self) -> bool {
+    fn potential_normal(&self) -> bool {
         // TODO: Replace with actual values once calculated.
-        if self.output().is_powered() {
+        if self.output_potential().is_powered() {
             true
         } else {
             false
@@ -68,18 +65,18 @@ impl ProvidePotential for EngineGenerator {
     }
 }
 impl ProvideFrequency for EngineGenerator {
-    fn get_frequency(&self) -> Frequency {
+    fn frequency(&self) -> Frequency {
         // TODO: Replace with actual values once calculated.
-        if self.output().is_powered() {
+        if self.output_potential().is_powered() {
             Frequency::new::<hertz>(400.)
         } else {
             Frequency::new::<hertz>(0.)
         }
     }
 
-    fn get_frequency_normal(&self) -> bool {
+    fn frequency_normal(&self) -> bool {
         // TODO: Replace with actual values once calculated.
-        if self.output().is_powered() {
+        if self.output_potential().is_powered() {
             true
         } else {
             false
@@ -87,48 +84,53 @@ impl ProvideFrequency for EngineGenerator {
     }
 }
 impl ProvideLoad for EngineGenerator {
-    fn get_load(&self) -> Ratio {
+    fn load(&self) -> Ratio {
         // TODO: Replace with actual values once calculated.
         Ratio::new::<percent>(0.)
     }
 
-    fn get_load_normal(&self) -> bool {
+    fn load_normal(&self) -> bool {
         // TODO: Replace with actual values once calculated.
         true
     }
 }
-impl SimulatorElementVisitable for EngineGenerator {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
-        visitor.visit(&mut Box::new(self));
+impl SimulationElement for EngineGenerator {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
+        self.idg.accept(visitor);
+
+        visitor.visit(self);
     }
-}
-impl SimulatorElement for EngineGenerator {
-    fn write_power_consumption(&mut self, state: &PowerConsumptionState) {
-        let watts =
-            state.get_total_consumption_for(&ElectricPowerSource::EngineGenerator(self.number));
+
+    fn write_power_consumption(&mut self, _state: &PowerConsumptionState) {
         // TODO
     }
 
-    fn write(&self, state: &mut SimulatorWriter) {
-        self.writer.write_alternating_with_load(self, state);
+    fn write(&self, writer: &mut SimulatorWriter) {
+        self.writer.write_alternating_with_load(self, writer);
     }
 }
 
 pub struct IntegratedDriveGenerator {
+    oil_outlet_temperature_id: String,
     oil_outlet_temperature: ThermodynamicTemperature,
-    time_above_threshold_in_milliseconds: u64,
+    is_connected_id: String,
     connected: bool,
+
+    time_above_threshold_in_milliseconds: u64,
 }
 impl IntegratedDriveGenerator {
     pub const ENGINE_N2_POWER_UP_OUTPUT_THRESHOLD: f64 = 58.;
     pub const ENGINE_N2_POWER_DOWN_OUTPUT_THRESHOLD: f64 = 56.;
     const STABILIZATION_TIME_IN_MILLISECONDS: u64 = 500;
 
-    fn new() -> IntegratedDriveGenerator {
+    fn new(number: usize) -> IntegratedDriveGenerator {
         IntegratedDriveGenerator {
+            oil_outlet_temperature_id: format!("ENG_GEN_{}_IDG_OIL_OUTLET_TEMPERATURE", number),
             oil_outlet_temperature: ThermodynamicTemperature::new::<degree_celsius>(0.),
-            time_above_threshold_in_milliseconds: 0,
+            is_connected_id: format!("ENG_GEN_{}_IDG_IS_CONNECTED", number),
             connected: true,
+
+            time_above_threshold_in_milliseconds: 0,
         }
     }
 
@@ -224,6 +226,15 @@ impl IntegratedDriveGenerator {
         ThermodynamicTemperature::new::<degree_celsius>(target_idg)
     }
 }
+impl SimulationElement for IntegratedDriveGenerator {
+    fn write(&self, writer: &mut SimulatorWriter) {
+        writer.write_f64(
+            &self.oil_outlet_temperature_id,
+            self.oil_outlet_temperature.get::<degree_celsius>(),
+        );
+        writer.write_bool(&self.is_connected_id, self.connected);
+    }
+}
 
 /// Experimental feature copied from Rust stb lib.
 fn clamp<T: PartialOrd>(value: T, min: T, max: T) -> T {
@@ -264,7 +275,7 @@ mod tests {
     #[cfg(test)]
     mod engine_generator_tests {
         use super::*;
-        use crate::simulator::test_helpers::context_with;
+        use crate::simulation::{context_with, test::TestReaderWriter};
         use std::time::Duration;
 
         #[test]
@@ -305,17 +316,18 @@ mod tests {
         #[test]
         fn writes_its_state() {
             let engine_gen = engine_generator();
-            let mut state = SimulatorWriter::new_for_test();
+            let mut test_writer = TestReaderWriter::new();
+            let mut writer = SimulatorWriter::new(&mut test_writer);
 
-            engine_gen.write(&mut state);
+            engine_gen.write(&mut writer);
 
-            assert!(state.len_is(6));
-            assert!(state.contains_f64("ELEC_ENG_GEN_1_POTENTIAL", 0.));
-            assert!(state.contains_bool("ELEC_ENG_GEN_1_POTENTIAL_NORMAL", false));
-            assert!(state.contains_f64("ELEC_ENG_GEN_1_FREQUENCY", 0.));
-            assert!(state.contains_bool("ELEC_ENG_GEN_1_FREQUENCY_NORMAL", false));
-            assert!(state.contains_f64("ELEC_ENG_GEN_1_LOAD", 0.));
-            assert!(state.contains_bool("ELEC_ENG_GEN_1_LOAD_NORMAL", true));
+            assert!(test_writer.len_is(6));
+            assert!(test_writer.contains_f64("ELEC_ENG_GEN_1_POTENTIAL", 0.));
+            assert!(test_writer.contains_bool("ELEC_ENG_GEN_1_POTENTIAL_NORMAL", false));
+            assert!(test_writer.contains_f64("ELEC_ENG_GEN_1_FREQUENCY", 0.));
+            assert!(test_writer.contains_bool("ELEC_ENG_GEN_1_FREQUENCY_NORMAL", false));
+            assert!(test_writer.contains_f64("ELEC_ENG_GEN_1_LOAD", 0.));
+            assert!(test_writer.contains_bool("ELEC_ENG_GEN_1_LOAD_NORMAL", true));
         }
 
         fn engine_generator() -> EngineGenerator {
@@ -341,14 +353,26 @@ mod tests {
 
     #[cfg(test)]
     mod integrated_drive_generator_tests {
-        use std::time::Duration;
-
-        use crate::simulator::test_helpers::context_with;
+        use crate::simulation::{context_with, test::TestReaderWriter};
 
         use super::*;
+        use std::time::Duration;
 
         fn idg() -> IntegratedDriveGenerator {
-            IntegratedDriveGenerator::new()
+            IntegratedDriveGenerator::new(1)
+        }
+
+        #[test]
+        fn writes_its_state() {
+            let idg = idg();
+            let mut test_writer = TestReaderWriter::new();
+            let mut writer = SimulatorWriter::new(&mut test_writer);
+
+            idg.write(&mut writer);
+
+            assert!(test_writer.len_is(2));
+            assert!(test_writer.contains_f64("ENG_GEN_1_IDG_OIL_OUTLET_TEMPERATURE", 0.));
+            assert!(test_writer.contains_bool("ENG_GEN_1_IDG_IS_CONNECTED", true));
         }
 
         #[test]

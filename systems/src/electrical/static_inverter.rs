@@ -1,55 +1,49 @@
 use super::{
-    Current, ElectricPowerSource, ElectricSource, ElectricalStateWriter, PowerConsumptionState,
-    Powerable, ProvideFrequency, ProvidePotential,
+    ElectricalStateWriter, Potential, PotentialSource, PotentialTarget, PowerConsumptionState,
+    ProvideFrequency, ProvidePotential,
 };
-use crate::simulator::{
-    SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorWriter,
-};
+use crate::simulation::{SimulationElement, SimulatorWriter};
 use uom::si::{electric_potential::volt, f64::*, frequency::hertz};
 
 pub struct StaticInverter {
     writer: ElectricalStateWriter,
-    input: Current,
+    input: Potential,
 }
 impl StaticInverter {
     pub fn new() -> StaticInverter {
         StaticInverter {
             writer: ElectricalStateWriter::new("STAT_INV"),
-            input: Current::none(),
+            input: Potential::None,
         }
     }
-}
-impl Powerable for StaticInverter {
-    fn set_input(&mut self, current: Current) {
-        self.input = current;
-    }
 
-    fn get_input(&self) -> Current {
+    pub fn input_potential(&self) -> Potential {
         self.input
     }
 }
-impl ElectricSource for StaticInverter {
-    fn output(&self) -> Current {
+potential_target!(StaticInverter);
+impl PotentialSource for StaticInverter {
+    fn output_potential(&self) -> Potential {
         if self.input.is_powered() {
-            Current::some(ElectricPowerSource::StaticInverter)
+            Potential::StaticInverter
         } else {
-            Current::none()
+            Potential::None
         }
     }
 }
 impl ProvidePotential for StaticInverter {
-    fn get_potential(&self) -> ElectricPotential {
+    fn potential(&self) -> ElectricPotential {
         // TODO: Replace with actual values once calculated.
-        if self.output().is_powered() {
+        if self.output_potential().is_powered() {
             ElectricPotential::new::<volt>(115.)
         } else {
             ElectricPotential::new::<volt>(0.)
         }
     }
 
-    fn get_potential_normal(&self) -> bool {
+    fn potential_normal(&self) -> bool {
         // TODO: Replace with actual values once calculated.
-        if self.output().is_powered() {
+        if self.output_potential().is_powered() {
             true
         } else {
             false
@@ -57,54 +51,51 @@ impl ProvidePotential for StaticInverter {
     }
 }
 impl ProvideFrequency for StaticInverter {
-    fn get_frequency(&self) -> Frequency {
+    fn frequency(&self) -> Frequency {
         // TODO: Replace with actual values once calculated.
-        if self.output().is_powered() {
+        if self.output_potential().is_powered() {
             Frequency::new::<hertz>(400.)
         } else {
             Frequency::new::<hertz>(0.)
         }
     }
 
-    fn get_frequency_normal(&self) -> bool {
+    fn frequency_normal(&self) -> bool {
         // TODO: Replace with actual values once calculated.
-        if self.output().is_powered() {
+        if self.output_potential().is_powered() {
             true
         } else {
             false
         }
     }
 }
-impl SimulatorElementVisitable for StaticInverter {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
-        visitor.visit(&mut Box::new(self));
-    }
-}
-impl SimulatorElement for StaticInverter {
-    fn write_power_consumption(&mut self, state: &PowerConsumptionState) {
+impl SimulationElement for StaticInverter {
+    fn write_power_consumption(&mut self, _state: &PowerConsumptionState) {
         // TODO
     }
 
-    fn write(&self, state: &mut SimulatorWriter) {
-        self.writer.write_alternating(self, state);
+    fn write(&self, writer: &mut SimulatorWriter) {
+        self.writer.write_alternating(self, writer);
     }
 }
 
 #[cfg(test)]
 mod static_inverter_tests {
+    use crate::simulation::test::TestReaderWriter;
+
     use super::*;
 
     struct Powerless {}
-    impl ElectricSource for Powerless {
-        fn output(&self) -> Current {
-            Current::none()
+    impl PotentialSource for Powerless {
+        fn output_potential(&self) -> Potential {
+            Potential::None
         }
     }
 
     struct Powered {}
-    impl ElectricSource for Powered {
-        fn output(&self) -> Current {
-            Current::some(ElectricPowerSource::ApuGenerator)
+    impl PotentialSource for Powered {
+        fn output_potential(&self) -> Potential {
+            Potential::ApuGenerator(1)
         }
     }
 
@@ -132,15 +123,16 @@ mod static_inverter_tests {
     #[test]
     fn writes_its_state() {
         let static_inverter = static_inverter();
-        let mut state = SimulatorWriter::new_for_test();
+        let mut test_writer = TestReaderWriter::new();
+        let mut writer = SimulatorWriter::new(&mut test_writer);
 
-        static_inverter.write(&mut state);
+        static_inverter.write(&mut writer);
 
-        assert!(state.len_is(4));
-        assert!(state.contains_f64("ELEC_STAT_INV_POTENTIAL", 0.));
-        assert!(state.contains_bool("ELEC_STAT_INV_POTENTIAL_NORMAL", false));
-        assert!(state.contains_f64("ELEC_STAT_INV_FREQUENCY", 0.));
-        assert!(state.contains_bool("ELEC_STAT_INV_FREQUENCY_NORMAL", false));
+        assert!(test_writer.len_is(4));
+        assert!(test_writer.contains_f64("ELEC_STAT_INV_POTENTIAL", 0.));
+        assert!(test_writer.contains_bool("ELEC_STAT_INV_POTENTIAL_NORMAL", false));
+        assert!(test_writer.contains_f64("ELEC_STAT_INV_FREQUENCY", 0.));
+        assert!(test_writer.contains_bool("ELEC_STAT_INV_FREQUENCY_NORMAL", false));
     }
 
     fn static_inverter() -> StaticInverter {

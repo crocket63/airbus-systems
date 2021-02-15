@@ -1,10 +1,11 @@
 use super::A320Hydraulic;
-use crate::{
-    apu::AuxiliaryPowerUnit,
+use std::time::Duration;
+use systems::{
+    apu::{ApuGenerator, AuxiliaryPowerUnit},
     electrical::{
-        combine_electric_sources, Battery, CombinedElectricSource, Contactor, ElectricSource,
-        ElectricalBus, ElectricalBusStateFactory, ElectricalBusType, EmergencyGenerator,
-        EngineGenerator, ExternalPowerSource, PowerSupply, Powerable, StaticInverter,
+        combine_potential_sources, Battery, CombinedPotentialSource, Contactor, ElectricalBus,
+        ElectricalBusStateFactory, ElectricalBusType, EmergencyGenerator, EngineGenerator,
+        ExternalPowerSource, PotentialSource, PotentialTarget, PowerSupply, StaticInverter,
         TransformerRectifier,
     },
     engine::Engine,
@@ -13,32 +14,32 @@ use crate::{
         OnOffAvailablePushButton, OnOffFaultPushButton,
     },
     shared::DelayedTrueLogicGate,
-    simulator::{
-        SimulatorElement, SimulatorElementVisitable, SimulatorElementVisitor, SimulatorReader,
-        SimulatorWriter, UpdateContext,
-    },
+    simulation::{SimulationElement, SimulationElementVisitor, SimulatorWriter, UpdateContext},
 };
-use std::time::Duration;
 use uom::si::{f64::*, velocity::knot};
 
 pub struct A320Electrical {
     alternating_current: A320AlternatingCurrentElectrical,
     direct_current: A320DirectCurrentElectrical,
+    main_galley: MainGalley,
+    secondary_galley: SecondaryGalley,
 }
 impl A320Electrical {
     pub fn new() -> A320Electrical {
         A320Electrical {
             alternating_current: A320AlternatingCurrentElectrical::new(),
             direct_current: A320DirectCurrentElectrical::new(),
+            main_galley: MainGalley::new(),
+            secondary_galley: SecondaryGalley::new(),
         }
     }
 
-    pub fn update(
+    pub fn update<T: ApuGenerator>(
         &mut self,
         context: &UpdateContext,
         engine1: &Engine,
         engine2: &Engine,
-        apu: &AuxiliaryPowerUnit,
+        apu: &AuxiliaryPowerUnit<T>,
         ext_pwr: &ExternalPowerSource,
         hydraulic: &A320Hydraulic,
         overhead: &A320ElectricalOverheadPanel,
@@ -54,6 +55,11 @@ impl A320Electrical {
 
         self.alternating_current
             .update_with_direct_current_state(context, &self.direct_current);
+
+        self.main_galley
+            .update(context, &self.alternating_current, overhead);
+        self.secondary_galley
+            .update(&self.alternating_current, overhead);
 
         self.debug_assert_invariants();
     }
@@ -106,6 +112,10 @@ impl A320Electrical {
         self.direct_current.hot_bus_2()
     }
 
+    fn galley_is_shed(&self) -> bool {
+        self.main_galley.is_shed() || self.secondary_galley.is_shed()
+    }
+
     fn debug_assert_invariants(&self) {
         self.alternating_current.debug_assert_invariants();
         self.direct_current.debug_assert_invariants();
@@ -130,14 +140,17 @@ impl ElectricalBusStateFactory for A320Electrical {
         state
     }
 }
-impl SimulatorElementVisitable for A320Electrical {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+impl SimulationElement for A320Electrical {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
         self.alternating_current.accept(visitor);
         self.direct_current.accept(visitor);
-        visitor.visit(&mut Box::new(self));
+        visitor.visit(self);
+    }
+
+    fn write(&self, writer: &mut SimulatorWriter) {
+        writer.write_bool("ELEC_GALLEY_IS_SHED", self.galley_is_shed())
     }
 }
-impl SimulatorElement for A320Electrical {}
 
 trait AlternatingCurrentState {
     fn ac_bus_1_and_2_unpowered(&self) -> bool;
@@ -150,6 +163,56 @@ trait AlternatingCurrentState {
     fn tr_1(&self) -> &TransformerRectifier;
     fn tr_2(&self) -> &TransformerRectifier;
     fn tr_ess(&self) -> &TransformerRectifier;
+}
+
+struct MainGalley {
+    is_shed: bool,
+}
+impl MainGalley {
+    fn new() -> Self {
+        Self { is_shed: false }
+    }
+
+    fn is_shed(&self) -> bool {
+        self.is_shed
+    }
+
+    fn update(
+        &mut self,
+        context: &UpdateContext,
+        alternating_current: &A320AlternatingCurrentElectrical,
+        overhead: &A320ElectricalOverheadPanel,
+    ) {
+        self.is_shed = alternating_current.main_sources_unpowered()
+            || alternating_current.main_sources_powered_by_single_engine_generator_only()
+            || (alternating_current.main_sources_powered_by_apu_generator_only()
+                && context.is_in_flight())
+            || overhead.commercial_is_off()
+            || overhead.galy_and_cab_is_off();
+    }
+}
+
+struct SecondaryGalley {
+    is_shed: bool,
+}
+impl SecondaryGalley {
+    fn new() -> Self {
+        Self { is_shed: false }
+    }
+
+    fn is_shed(&self) -> bool {
+        self.is_shed
+    }
+
+    fn update(
+        &mut self,
+        alternating_current: &A320AlternatingCurrentElectrical,
+        overhead: &A320ElectricalOverheadPanel,
+    ) {
+        self.is_shed = alternating_current.main_sources_unpowered()
+            || overhead.commercial_is_off()
+            || overhead.galy_and_cab_is_off();
+    }
 }
 
 struct A320AlternatingCurrentElectrical {
@@ -192,12 +255,12 @@ impl A320AlternatingCurrentElectrical {
         }
     }
 
-    fn update(
+    fn update<T: ApuGenerator>(
         &mut self,
         context: &UpdateContext,
         engine1: &Engine,
         engine2: &Engine,
-        apu: &AuxiliaryPowerUnit,
+        apu: &AuxiliaryPowerUnit<T>,
         ext_pwr: &ExternalPowerSource,
         hydraulic: &A320Hydraulic,
         overhead: &A320ElectricalOverheadPanel,
@@ -277,6 +340,19 @@ impl A320AlternatingCurrentElectrical {
         self.ac_ess_shed_bus.powered_by(&self.ac_ess_shed_contactor);
     }
 
+    fn main_sources_powered_by_single_engine_generator_only(&self) -> bool {
+        self.main_power_sources
+            .powered_by_single_engine_generator_only()
+    }
+
+    fn main_sources_powered_by_apu_generator_only(&self) -> bool {
+        self.main_power_sources.powered_by_apu_generator_only()
+    }
+
+    fn main_sources_unpowered(&self) -> bool {
+        self.main_power_sources.unpowered()
+    }
+
     /// Determines if 15XE2 should be closed. 15XE2 is the contactor which connects
     /// the static inverter to the AC ESS BUS.
     fn should_close_15xe2_contactor(&self, context: &UpdateContext) -> bool {
@@ -347,8 +423,8 @@ impl AlternatingCurrentState for A320AlternatingCurrentElectrical {
         &self.tr_ess
     }
 }
-impl SimulatorElementVisitable for A320AlternatingCurrentElectrical {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+impl SimulationElement for A320AlternatingCurrentElectrical {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
         self.emergency_gen.accept(visitor);
         self.main_power_sources.accept(visitor);
         self.ac_ess_feed_contactors.accept(visitor);
@@ -367,10 +443,9 @@ impl SimulatorElementVisitable for A320AlternatingCurrentElectrical {
         self.ac_ess_shed_bus.accept(visitor);
         self.ac_stat_inv_bus.accept(visitor);
 
-        visitor.visit(&mut Box::new(self));
+        visitor.visit(self);
     }
 }
-impl SimulatorElement for A320AlternatingCurrentElectrical {}
 
 trait DirectCurrentState {
     fn static_inverter(&self) -> &StaticInverter;
@@ -466,8 +541,6 @@ impl A320DirectCurrentElectrical {
         self.battery_1_contactor.powered_by(&self.dc_bat_bus);
         self.battery_2_contactor.powered_by(&self.dc_bat_bus);
 
-        // TODO: The actual logic for battery contactors is more complex, however
-        // not all systems is relates to are implemented yet. We'll have to get back to this later.
         let airspeed_below_100_knots = context.indicated_airspeed < Velocity::new::<knot>(100.);
         let batteries_should_supply_bat_bus =
             ac_state.ac_bus_1_and_2_unpowered() && airspeed_below_100_knots;
@@ -609,8 +682,8 @@ impl DirectCurrentState for A320DirectCurrentElectrical {
         &self.static_inverter
     }
 }
-impl SimulatorElementVisitable for A320DirectCurrentElectrical {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+impl SimulationElement for A320DirectCurrentElectrical {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
         self.battery_1.accept(visitor);
         self.battery_2.accept(visitor);
         self.static_inverter.accept(visitor);
@@ -635,10 +708,9 @@ impl SimulatorElementVisitable for A320DirectCurrentElectrical {
         self.hot_bus_1.accept(visitor);
         self.hot_bus_2.accept(visitor);
 
-        visitor.visit(&mut Box::new(self));
+        visitor.visit(self);
     }
 }
-impl SimulatorElement for A320DirectCurrentElectrical {}
 
 struct A320MainPowerSources {
     engine_1_gen: EngineGenerator,
@@ -664,12 +736,12 @@ impl A320MainPowerSources {
         }
     }
 
-    fn update(
+    fn update<T: ApuGenerator>(
         &mut self,
         context: &UpdateContext,
         engine1: &Engine,
         engine2: &Engine,
-        apu: &AuxiliaryPowerUnit,
+        apu: &AuxiliaryPowerUnit<T>,
         ext_pwr: &ExternalPowerSource,
         overhead: &A320ElectricalOverheadPanel,
     ) {
@@ -732,22 +804,42 @@ impl A320MainPowerSources {
             .or_powered_by(&self.bus_tie_1_contactor);
     }
 
-    fn ac_bus_1_electric_sources(&self) -> CombinedElectricSource {
-        combine_electric_sources(vec![
+    fn ac_bus_1_electric_sources(&self) -> CombinedPotentialSource {
+        combine_potential_sources(vec![
             &self.engine_1_gen_contactor,
             &self.bus_tie_1_contactor,
         ])
     }
 
-    fn ac_bus_2_electric_sources(&self) -> CombinedElectricSource {
-        combine_electric_sources(vec![
+    fn ac_bus_2_electric_sources(&self) -> CombinedPotentialSource {
+        combine_potential_sources(vec![
             &self.engine_2_gen_contactor,
             &self.bus_tie_2_contactor,
         ])
     }
+
+    fn powered_by_single_engine_generator_only(&self) -> bool {
+        (self.engine_1_gen_contactor.is_powered() ^ self.engine_2_gen_contactor.is_powered())
+            && self.apu_gen_contactor.is_unpowered()
+            && self.ext_pwr_contactor.is_unpowered()
+    }
+
+    fn powered_by_apu_generator_only(&self) -> bool {
+        self.engine_1_gen_contactor.is_unpowered()
+            && self.engine_2_gen_contactor.is_unpowered()
+            && self.ext_pwr_contactor.is_unpowered()
+            && self.apu_gen_contactor.is_powered()
+    }
+
+    fn unpowered(&self) -> bool {
+        self.engine_1_gen_contactor.is_unpowered()
+            && self.engine_2_gen_contactor.is_unpowered()
+            && self.ext_pwr_contactor.is_unpowered()
+            && self.apu_gen_contactor.is_unpowered()
+    }
 }
-impl SimulatorElementVisitable for A320MainPowerSources {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+impl SimulationElement for A320MainPowerSources {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
         self.engine_1_gen.accept(visitor);
         self.engine_2_gen.accept(visitor);
 
@@ -758,10 +850,9 @@ impl SimulatorElementVisitable for A320MainPowerSources {
         self.apu_gen_contactor.accept(visitor);
         self.ext_pwr_contactor.accept(visitor);
 
-        visitor.visit(&mut Box::new(self));
+        visitor.visit(self);
     }
 }
-impl SimulatorElement for A320MainPowerSources {}
 
 struct A320AcEssFeedContactors {
     ac_ess_feed_contactor_1: Contactor,
@@ -806,26 +897,25 @@ impl A320AcEssFeedContactors {
         self.ac_ess_feed_contactor_2.powered_by(ac_bus_2);
     }
 
-    fn electric_sources(&self) -> CombinedElectricSource {
-        combine_electric_sources(vec![
+    fn electric_sources(&self) -> CombinedPotentialSource {
+        combine_potential_sources(vec![
             &self.ac_ess_feed_contactor_1,
             &self.ac_ess_feed_contactor_2,
         ])
     }
 
     fn provides_power(&self) -> bool {
-        self.electric_sources().output().is_powered()
+        self.electric_sources().output_potential().is_powered()
     }
 }
-impl SimulatorElementVisitable for A320AcEssFeedContactors {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+impl SimulationElement for A320AcEssFeedContactors {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
         self.ac_ess_feed_contactor_1.accept(visitor);
         self.ac_ess_feed_contactor_2.accept(visitor);
 
-        visitor.visit(&mut Box::new(self));
+        visitor.visit(self);
     }
 }
-impl SimulatorElement for A320AcEssFeedContactors {}
 
 pub struct A320ElectricalOverheadPanel {
     bat_1: AutoOffFaultPushButton,
@@ -904,13 +994,21 @@ impl A320ElectricalOverheadPanel {
         self.bat_2.is_auto()
     }
 
+    fn commercial_is_off(&self) -> bool {
+        self.commercial.is_off()
+    }
+
+    fn galy_and_cab_is_off(&self) -> bool {
+        self.galy_and_cab.is_off()
+    }
+
     #[cfg(test)]
     fn ac_ess_feed_has_fault(&self) -> bool {
         self.ac_ess_feed.has_fault()
     }
 }
-impl SimulatorElementVisitable for A320ElectricalOverheadPanel {
-    fn accept(&mut self, visitor: &mut Box<&mut dyn SimulatorElementVisitor>) {
+impl SimulationElement for A320ElectricalOverheadPanel {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
         self.bat_1.accept(visitor);
         self.bat_2.accept(visitor);
         self.idg_1.accept(visitor);
@@ -924,18 +1022,35 @@ impl SimulatorElementVisitable for A320ElectricalOverheadPanel {
         self.ext_pwr.accept(visitor);
         self.commercial.accept(visitor);
 
-        visitor.visit(&mut Box::new(self));
+        visitor.visit(self);
     }
 }
-impl SimulatorElement for A320ElectricalOverheadPanel {}
+
+#[cfg(test)]
+mod a320_electrical {
+    use crate::A320Electrical;
+    use systems::simulation::{test::TestReaderWriter, SimulationElement, SimulatorWriter};
+
+    #[test]
+    fn writes_its_state() {
+        let elec = A320Electrical::new();
+        let mut test_writer = TestReaderWriter::new();
+        let mut writer = SimulatorWriter::new(&mut test_writer);
+
+        elec.write(&mut writer);
+
+        assert!(test_writer.len_is(1));
+        assert!(test_writer.contains_bool("ELEC_GALLEY_IS_SHED", false));
+    }
+}
 
 #[cfg(test)]
 mod a320_electrical_circuit_tests {
-    use crate::{
-        apu::tests::{running_apu, stopped_apu},
-        electrical::{Current, ElectricPowerSource},
+    use systems::{
+        apu::{Aps3200ApuGenerator, AuxiliaryPowerUnitFactory},
+        electrical::Potential,
+        simulation::context_with,
     };
-
     use uom::si::{
         length::foot, ratio::percent, thermodynamic_temperature::degree_celsius, velocity::knot,
     };
@@ -953,22 +1068,22 @@ mod a320_electrical_circuit_tests {
             .airspeed(Velocity::new::<knot>(0.))
             .run();
 
-        assert_eq!(tester.ac_bus_1_output(), Current::none());
-        assert_eq!(tester.ac_bus_2_output(), Current::none());
-        assert_eq!(tester.ac_ess_bus_output(), Current::none());
-        assert_eq!(tester.ac_ess_shed_bus_output(), Current::none());
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
-        assert_eq!(tester.tr_1_input(), Current::none());
-        assert_eq!(tester.tr_2_input(), Current::none());
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(tester.dc_bus_1_output(), Current::none());
-        assert_eq!(tester.dc_bus_2_output(), Current::none());
-        assert_eq!(tester.dc_bat_bus_output(), Current::none());
-        assert_eq!(tester.dc_ess_bus_output(), Current::none());
-        assert_eq!(tester.dc_ess_shed_bus_output(), Current::none());
-        assert_eq!(tester.hot_bus_1_output(), Current::none());
-        assert_eq!(tester.hot_bus_2_output(), Current::none());
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.ac_ess_bus_output_potential(), Potential::None);
+        assert_eq!(tester.ac_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::None);
+        assert_eq!(tester.tr_2_input(), Potential::None);
+        assert_eq!(tester.tr_ess_input(), Potential::None);
+        assert_eq!(tester.dc_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bat_bus_output_potential(), Potential::None);
+        assert_eq!(tester.dc_ess_bus_output_potential(), Potential::None);
+        assert_eq!(tester.dc_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::None);
     }
 
     #[test]
@@ -980,28 +1095,22 @@ mod a320_electrical_circuit_tests {
             .airspeed(Velocity::new::<knot>(0.))
             .run();
 
-        assert_eq!(tester.ac_bus_1_output(), Current::none());
-        assert_eq!(tester.ac_bus_2_output(), Current::none());
-        assert_eq!(tester.ac_ess_bus_output(), Current::none());
-        assert_eq!(tester.ac_ess_shed_bus_output(), Current::none());
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
-        assert_eq!(tester.tr_1_input(), Current::none());
-        assert_eq!(tester.tr_2_input(), Current::none());
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(tester.dc_bus_1_output(), Current::none());
-        assert_eq!(tester.dc_bus_2_output(), Current::none());
-        assert_eq!(tester.dc_bat_bus_output(), Current::none());
-        assert_eq!(tester.dc_ess_bus_output(), Current::none());
-        assert_eq!(tester.dc_ess_shed_bus_output(), Current::none());
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.ac_ess_bus_output_potential(), Potential::None);
+        assert_eq!(tester.ac_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::None);
+        assert_eq!(tester.tr_2_input(), Potential::None);
+        assert_eq!(tester.tr_ess_input(), Potential::None);
+        assert_eq!(tester.dc_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bat_bus_output_potential(), Potential::None);
+        assert_eq!(tester.dc_ess_bus_output_potential(), Potential::None);
+        assert_eq!(tester.dc_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1011,60 +1120,48 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engines().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(2)
         );
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::EngineGenerator(1));
+        assert_eq!(tester.tr_2_input(), Potential::EngineGenerator(2));
+        assert_eq!(tester.tr_ess_input(), Potential::None);
         assert_eq!(
-            tester.tr_1_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
-        );
-        assert_eq!(
-            tester.tr_2_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
-        );
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(
-            tester.dc_bus_1_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bus_1_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_bus_2_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(2))
+            tester.dc_bus_2_output_potential(),
+            Potential::TransformerRectifier(2)
         );
         assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bat_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1074,60 +1171,48 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engine_1().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::EngineGenerator(1));
+        assert_eq!(tester.tr_2_input(), Potential::EngineGenerator(1));
+        assert_eq!(tester.tr_ess_input(), Potential::None);
         assert_eq!(
-            tester.tr_1_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
-        );
-        assert_eq!(
-            tester.tr_2_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
-        );
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(
-            tester.dc_bus_1_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bus_1_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_bus_2_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(2))
+            tester.dc_bus_2_output_potential(),
+            Potential::TransformerRectifier(2)
         );
         assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bat_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1137,60 +1222,48 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engine_2().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(2)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(2)
         );
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(2)
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::EngineGenerator(2)
         );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::EngineGenerator(2));
+        assert_eq!(tester.tr_2_input(), Potential::EngineGenerator(2));
+        assert_eq!(tester.tr_ess_input(), Potential::None);
         assert_eq!(
-            tester.tr_1_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
-        );
-        assert_eq!(
-            tester.tr_2_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
-        );
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(
-            tester.dc_bus_1_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bus_1_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_bus_2_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(2))
+            tester.dc_bus_2_output_potential(),
+            Potential::TransformerRectifier(2)
         );
         assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bat_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1200,60 +1273,48 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_apu().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::ApuGenerator)
+            tester.ac_bus_1_output_potential(),
+            Potential::ApuGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::ApuGenerator)
+            tester.ac_bus_2_output_potential(),
+            Potential::ApuGenerator(1)
         );
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::ApuGenerator)
+            tester.ac_ess_bus_output_potential(),
+            Potential::ApuGenerator(1)
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::ApuGenerator)
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::ApuGenerator(1)
         );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::ApuGenerator(1));
+        assert_eq!(tester.tr_2_input(), Potential::ApuGenerator(1));
+        assert_eq!(tester.tr_ess_input(), Potential::None);
         assert_eq!(
-            tester.tr_1_input(),
-            Current::some(ElectricPowerSource::ApuGenerator)
-        );
-        assert_eq!(
-            tester.tr_2_input(),
-            Current::some(ElectricPowerSource::ApuGenerator)
-        );
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(
-            tester.dc_bus_1_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bus_1_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_bus_2_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(2))
+            tester.dc_bus_2_output_potential(),
+            Potential::TransformerRectifier(2)
         );
         assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bat_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1267,61 +1328,40 @@ mod a320_electrical_circuit_tests {
             .ext_pwr_on()
             .run();
 
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::External);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::External);
+        assert_eq!(tester.ac_ess_bus_output_potential(), Potential::External);
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::External)
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::External
+        );
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::External);
+        assert_eq!(tester.tr_2_input(), Potential::External);
+        assert_eq!(tester.tr_ess_input(), Potential::None);
+        assert_eq!(
+            tester.dc_bus_1_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::External)
+            tester.dc_bus_2_output_potential(),
+            Potential::TransformerRectifier(2)
         );
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::External)
+            tester.dc_bat_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::External)
-        );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
-        assert_eq!(
-            tester.tr_1_input(),
-            Current::some(ElectricPowerSource::External)
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.tr_2_input(),
-            Current::some(ElectricPowerSource::External)
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(
-            tester.dc_bus_1_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
-        );
-        assert_eq!(
-            tester.dc_bus_2_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(2))
-        );
-        assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
-        );
-        assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
-        );
-        assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
-        );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1330,40 +1370,28 @@ mod a320_electrical_circuit_tests {
     fn distribution_table_emergency_config_before_emergency_gen_available() {
         let tester = tester().run();
 
-        assert_eq!(tester.ac_bus_1_output(), Current::none());
-        assert_eq!(tester.ac_bus_2_output(), Current::none());
-        assert_eq!(tester.ac_ess_shed_bus_output(), Current::none());
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.ac_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.static_inverter_input(), Potential::Battery(10));
         assert_eq!(
-            tester.static_inverter_input(),
-            Current::some(ElectricPowerSource::Battery(10))
+            tester.ac_stat_inv_bus_output_potential(),
+            Potential::StaticInverter
         );
         assert_eq!(
-            tester.ac_stat_inv_bus_output(),
-            Current::some(ElectricPowerSource::StaticInverter)
+            tester.ac_ess_bus_output_potential(),
+            Potential::StaticInverter
         );
-        assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::StaticInverter)
-        );
-        assert_eq!(tester.tr_1_input(), Current::none());
-        assert_eq!(tester.tr_2_input(), Current::none());
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(tester.dc_bus_1_output(), Current::none());
-        assert_eq!(tester.dc_bus_2_output(), Current::none());
-        assert_eq!(tester.dc_bat_bus_output(), Current::none());
-        assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
-        assert_eq!(tester.dc_ess_shed_bus_output(), Current::none());
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.tr_1_input(), Potential::None);
+        assert_eq!(tester.tr_2_input(), Potential::None);
+        assert_eq!(tester.tr_ess_input(), Potential::None);
+        assert_eq!(tester.dc_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bat_bus_output_potential(), Potential::None);
+        assert_eq!(tester.dc_ess_bus_output_potential(), Potential::Battery(11));
+        assert_eq!(tester.dc_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1372,43 +1400,34 @@ mod a320_electrical_circuit_tests {
     fn distribution_table_emergency_config_after_emergency_gen_available() {
         let tester = tester_with().running_emergency_generator().run();
 
-        assert_eq!(tester.ac_bus_1_output(), Current::none());
-        assert_eq!(tester.ac_bus_2_output(), Current::none());
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::None);
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EmergencyGenerator)
+            tester.ac_ess_bus_output_potential(),
+            Potential::EmergencyGenerator
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::EmergencyGenerator)
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::EmergencyGenerator
         );
-        assert_eq!(tester.tr_1_input(), Current::none());
-        assert_eq!(tester.tr_2_input(), Current::none());
+        assert_eq!(tester.tr_1_input(), Potential::None);
+        assert_eq!(tester.tr_2_input(), Potential::None);
+        assert_eq!(tester.tr_ess_input(), Potential::EmergencyGenerator);
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bat_bus_output_potential(), Potential::None);
         assert_eq!(
-            tester.tr_ess_input(),
-            Current::some(ElectricPowerSource::EmergencyGenerator)
-        );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
-        assert_eq!(tester.dc_bus_1_output(), Current::none());
-        assert_eq!(tester.dc_bus_2_output(), Current::none());
-        assert_eq!(tester.dc_bat_bus_output(), Current::none());
-        assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
         assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1418,63 +1437,48 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engines().and().failed_tr_1().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(2)
         );
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::EngineGenerator(1));
+        assert_eq!(tester.tr_2_input(), Potential::EngineGenerator(2));
+        assert_eq!(tester.tr_ess_input(), Potential::EngineGenerator(1));
         assert_eq!(
-            tester.tr_1_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
-        );
-        assert_eq!(
-            tester.tr_2_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
-        );
-        assert_eq!(
-            tester.tr_ess_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.dc_bus_1_output_potential(),
+            Potential::TransformerRectifier(2)
         );
         assert_eq!(
-            tester.dc_bus_1_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(2))
+            tester.dc_bus_2_output_potential(),
+            Potential::TransformerRectifier(2)
         );
         assert_eq!(
-            tester.dc_bus_2_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(2))
+            tester.dc_bat_bus_output_potential(),
+            Potential::TransformerRectifier(2)
         );
         assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(2))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
         assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
-        assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
-        );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1484,63 +1488,48 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engines().and().failed_tr_2().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(2)
         );
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::EngineGenerator(1));
+        assert_eq!(tester.tr_2_input(), Potential::EngineGenerator(2));
+        assert_eq!(tester.tr_ess_input(), Potential::EngineGenerator(1));
         assert_eq!(
-            tester.tr_1_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
-        );
-        assert_eq!(
-            tester.tr_2_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
-        );
-        assert_eq!(
-            tester.tr_ess_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.dc_bus_1_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_bus_1_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bus_2_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_bus_2_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_bat_bus_output_potential(),
+            Potential::TransformerRectifier(1)
         );
         assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
         assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
-        assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
-        );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1555,54 +1544,39 @@ mod a320_electrical_circuit_tests {
             .run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(2)
         );
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::EngineGenerator(1));
+        assert_eq!(tester.tr_2_input(), Potential::EngineGenerator(2));
+        assert_eq!(tester.tr_ess_input(), Potential::EngineGenerator(1));
+        assert_eq!(tester.dc_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bat_bus_output_potential(), Potential::None);
         assert_eq!(
-            tester.tr_1_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
-        );
-        assert_eq!(
-            tester.tr_2_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
-        );
-        assert_eq!(
-            tester.tr_ess_input(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
-        );
-        assert_eq!(tester.dc_bus_1_output(), Current::none());
-        assert_eq!(tester.dc_bus_2_output(), Current::none());
-        assert_eq!(tester.dc_bat_bus_output(), Current::none());
-        assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
         assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1616,43 +1590,34 @@ mod a320_electrical_circuit_tests {
             .on_the_ground()
             .run();
 
-        assert_eq!(tester.ac_bus_1_output(), Current::none());
-        assert_eq!(tester.ac_bus_2_output(), Current::none());
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::None);
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EmergencyGenerator)
+            tester.ac_ess_bus_output_potential(),
+            Potential::EmergencyGenerator
         );
         assert_eq!(
-            tester.ac_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::EmergencyGenerator)
+            tester.ac_ess_shed_bus_output_potential(),
+            Potential::EmergencyGenerator
         );
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_stat_inv_bus_output(), Current::none());
-        assert_eq!(tester.tr_1_input(), Current::none());
-        assert_eq!(tester.tr_2_input(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_stat_inv_bus_output_potential(), Potential::None);
+        assert_eq!(tester.tr_1_input(), Potential::None);
+        assert_eq!(tester.tr_2_input(), Potential::None);
+        assert_eq!(tester.tr_ess_input(), Potential::EmergencyGenerator);
+        assert_eq!(tester.dc_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bat_bus_output_potential(), Potential::None);
         assert_eq!(
-            tester.tr_ess_input(),
-            Current::some(ElectricPowerSource::EmergencyGenerator)
-        );
-        assert_eq!(tester.dc_bus_1_output(), Current::none());
-        assert_eq!(tester.dc_bus_2_output(), Current::none());
-        assert_eq!(tester.dc_bat_bus_output(), Current::none());
-        assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
+            tester.dc_ess_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
         assert_eq!(
-            tester.dc_ess_shed_bus_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(3))
+            tester.dc_ess_shed_bus_output_potential(),
+            Potential::TransformerRectifier(3)
         );
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1666,43 +1631,28 @@ mod a320_electrical_circuit_tests {
             .on_the_ground()
             .run();
 
-        assert_eq!(tester.ac_bus_1_output(), Current::none());
-        assert_eq!(tester.ac_bus_2_output(), Current::none());
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::None);
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::StaticInverter)
+            tester.ac_ess_bus_output_potential(),
+            Potential::StaticInverter
         );
-        assert_eq!(tester.ac_ess_shed_bus_output(), Current::none());
+        assert_eq!(tester.ac_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.static_inverter_input(), Potential::Battery(10));
         assert_eq!(
-            tester.static_inverter_input(),
-            Current::some(ElectricPowerSource::Battery(10))
+            tester.ac_stat_inv_bus_output_potential(),
+            Potential::StaticInverter
         );
-        assert_eq!(
-            tester.ac_stat_inv_bus_output(),
-            Current::some(ElectricPowerSource::StaticInverter)
-        );
-        assert_eq!(tester.tr_1_input(), Current::none());
-        assert_eq!(tester.tr_2_input(), Current::none());
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(tester.dc_bus_1_output(), Current::none());
-        assert_eq!(tester.dc_bus_2_output(), Current::none());
-        assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::Batteries)
-        );
-        assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
-        assert_eq!(tester.dc_ess_shed_bus_output(), Current::none());
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.tr_1_input(), Potential::None);
+        assert_eq!(tester.tr_2_input(), Potential::None);
+        assert_eq!(tester.tr_ess_input(), Potential::None);
+        assert_eq!(tester.dc_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bat_bus_output_potential(), Potential::Batteries);
+        assert_eq!(tester.dc_ess_bus_output_potential(), Potential::Battery(11));
+        assert_eq!(tester.dc_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     /// # Source
@@ -1716,44 +1666,29 @@ mod a320_electrical_circuit_tests {
             .on_the_ground()
             .run();
 
-        assert_eq!(tester.ac_bus_1_output(), Current::none());
-        assert_eq!(tester.ac_bus_2_output(), Current::none());
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::None);
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::none(),
+            tester.ac_ess_bus_output_potential(),
+            Potential::None,
             "AC ESS BUS shouldn't be powered below 50 knots when on batteries only."
         );
-        assert_eq!(tester.ac_ess_shed_bus_output(), Current::none());
+        assert_eq!(tester.ac_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.static_inverter_input(), Potential::Battery(10));
         assert_eq!(
-            tester.static_inverter_input(),
-            Current::some(ElectricPowerSource::Battery(10))
+            tester.ac_stat_inv_bus_output_potential(),
+            Potential::StaticInverter
         );
-        assert_eq!(
-            tester.ac_stat_inv_bus_output(),
-            Current::some(ElectricPowerSource::StaticInverter)
-        );
-        assert_eq!(tester.tr_1_input(), Current::none());
-        assert_eq!(tester.tr_2_input(), Current::none());
-        assert_eq!(tester.tr_ess_input(), Current::none());
-        assert_eq!(tester.dc_bus_1_output(), Current::none());
-        assert_eq!(tester.dc_bus_2_output(), Current::none());
-        assert_eq!(
-            tester.dc_bat_bus_output(),
-            Current::some(ElectricPowerSource::Batteries)
-        );
-        assert_eq!(
-            tester.dc_ess_bus_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
-        assert_eq!(tester.dc_ess_shed_bus_output(), Current::none());
-        assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::Battery(11))
-        );
+        assert_eq!(tester.tr_1_input(), Potential::None);
+        assert_eq!(tester.tr_2_input(), Potential::None);
+        assert_eq!(tester.tr_ess_input(), Potential::None);
+        assert_eq!(tester.dc_bus_1_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bus_2_output_potential(), Potential::None);
+        assert_eq!(tester.dc_bat_bus_output_potential(), Potential::Batteries);
+        assert_eq!(tester.dc_ess_bus_output_potential(), Potential::Battery(11));
+        assert_eq!(tester.dc_ess_shed_bus_output_potential(), Potential::None);
+        assert_eq!(tester.hot_bus_1_output_potential(), Potential::Battery(10));
+        assert_eq!(tester.hot_bus_2_output_potential(), Potential::Battery(11));
     }
 
     #[test]
@@ -1781,8 +1716,8 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engine_1().and().running_apu().run();
 
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::ApuGenerator)
+            tester.ac_bus_2_output_potential(),
+            Potential::ApuGenerator(1)
         );
     }
 
@@ -1791,8 +1726,8 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engine_2().and().running_apu().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::ApuGenerator)
+            tester.ac_bus_1_output_potential(),
+            Potential::ApuGenerator(1)
         );
     }
 
@@ -1801,12 +1736,12 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_apu().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::ApuGenerator)
+            tester.ac_bus_1_output_potential(),
+            Potential::ApuGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::ApuGenerator)
+            tester.ac_bus_2_output_potential(),
+            Potential::ApuGenerator(1)
         );
     }
 
@@ -1819,10 +1754,7 @@ mod a320_electrical_circuit_tests {
             .ext_pwr_on()
             .run();
 
-        assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::External)
-        );
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::External);
     }
 
     #[test]
@@ -1834,10 +1766,7 @@ mod a320_electrical_circuit_tests {
             .ext_pwr_on()
             .run();
 
-        assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::External)
-        );
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::External);
     }
 
     #[test]
@@ -1848,14 +1777,8 @@ mod a320_electrical_circuit_tests {
             .ext_pwr_on()
             .run();
 
-        assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::External)
-        );
-        assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::External)
-        );
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::External);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::External);
     }
 
     #[test]
@@ -1867,14 +1790,8 @@ mod a320_electrical_circuit_tests {
             .running_apu()
             .run();
 
-        assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::External)
-        );
-        assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::External)
-        );
+        assert_eq!(tester.ac_bus_1_output_potential(), Potential::External);
+        assert_eq!(tester.ac_bus_2_output_potential(), Potential::External);
     }
 
     #[test]
@@ -1886,12 +1803,12 @@ mod a320_electrical_circuit_tests {
             .run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(2)
         );
     }
 
@@ -1900,12 +1817,12 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engines().and().running_apu().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(2)
         );
     }
 
@@ -1914,8 +1831,8 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engines().run();
 
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
     }
 
@@ -1928,8 +1845,8 @@ mod a320_electrical_circuit_tests {
             .bus_tie_off()
             .run_waiting_until_just_before_ac_ess_feed_transition();
 
-        assert_eq!(tester.static_inverter_input(), Current::none());
-        assert_eq!(tester.ac_ess_bus_output(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
+        assert_eq!(tester.ac_ess_bus_output_potential(), Potential::None);
     }
 
     #[test]
@@ -1941,7 +1858,7 @@ mod a320_electrical_circuit_tests {
             .bus_tie_off()
             .run_waiting_until_just_before_ac_ess_feed_transition();
 
-        assert_eq!(tester.dc_ess_bus_output(), Current::none());
+        assert_eq!(tester.dc_ess_bus_output_potential(), Potential::None);
     }
 
     #[test]
@@ -1953,7 +1870,7 @@ mod a320_electrical_circuit_tests {
             .airspeed(Velocity::new::<knot>(49.))
             .run_waiting_for(Duration::from_secs(1_000));
 
-        assert_eq!(tester.static_inverter_input(), Current::none());
+        assert_eq!(tester.static_inverter_input(), Potential::None);
     }
 
     #[test]
@@ -1965,10 +1882,7 @@ mod a320_electrical_circuit_tests {
             .airspeed(Velocity::new::<knot>(49.))
             .run_waiting_for(Duration::from_secs(1_000));
 
-        assert_eq!(
-            tester.static_inverter_input(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
+        assert_eq!(tester.static_inverter_input(), Potential::Battery(10));
     }
 
     #[test]
@@ -1978,13 +1892,10 @@ mod a320_electrical_circuit_tests {
             .airspeed(Velocity::new::<knot>(51.))
             .run_waiting_for(Duration::from_secs(1_000));
 
+        assert_eq!(tester.static_inverter_input(), Potential::Battery(10));
         assert_eq!(
-            tester.static_inverter_input(),
-            Current::some(ElectricPowerSource::Battery(10))
-        );
-        assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::StaticInverter)
+            tester.ac_ess_bus_output_potential(),
+            Potential::StaticInverter
         );
     }
 
@@ -2000,8 +1911,8 @@ mod a320_electrical_circuit_tests {
             .run_waiting_for_ac_ess_feed_transition();
 
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(2)
         );
     }
 
@@ -2023,8 +1934,8 @@ mod a320_electrical_circuit_tests {
             .run();
 
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(1)
         );
     }
 
@@ -2032,8 +1943,8 @@ mod a320_electrical_circuit_tests {
     fn when_gen_1_off_and_only_engine_1_running_nothing_powers_ac_buses() {
         let tester = tester_with().running_engine_1().and().gen_1_off().run();
 
-        assert!(tester.ac_bus_1_output().is_unpowered());
-        assert!(tester.ac_bus_2_output().is_unpowered());
+        assert!(tester.ac_bus_1_output_potential().is_unpowered());
+        assert!(tester.ac_bus_2_output_potential().is_unpowered());
     }
 
     #[test]
@@ -2041,12 +1952,12 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engines().and().gen_1_off().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(2)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(2)
         );
     }
 
@@ -2054,8 +1965,8 @@ mod a320_electrical_circuit_tests {
     fn when_gen_2_off_and_only_engine_2_running_nothing_powers_ac_buses() {
         let tester = tester_with().running_engine_2().and().gen_2_off().run();
 
-        assert!(tester.ac_bus_1_output().is_unpowered());
-        assert!(tester.ac_bus_2_output().is_unpowered());
+        assert!(tester.ac_bus_1_output_potential().is_unpowered());
+        assert!(tester.ac_bus_2_output_potential().is_unpowered());
     }
 
     #[test]
@@ -2063,12 +1974,12 @@ mod a320_electrical_circuit_tests {
         let tester = tester_with().running_engines().and().gen_2_off().run();
 
         assert_eq!(
-            tester.ac_bus_1_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_1_output_potential(),
+            Potential::EngineGenerator(1)
         );
         assert_eq!(
-            tester.ac_bus_2_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(1))
+            tester.ac_bus_2_output_potential(),
+            Potential::EngineGenerator(1)
         );
     }
 
@@ -2081,8 +1992,8 @@ mod a320_electrical_circuit_tests {
             .run();
 
         assert_eq!(
-            tester.ac_ess_bus_output(),
-            Current::some(ElectricPowerSource::EngineGenerator(2))
+            tester.ac_ess_bus_output_potential(),
+            Potential::EngineGenerator(2)
         );
     }
 
@@ -2090,8 +2001,8 @@ mod a320_electrical_circuit_tests {
     fn when_only_apu_running_but_apu_gen_push_button_off_nothing_powers_ac_bus_1_and_2() {
         let tester = tester_with().running_apu().and().apu_gen_off().run();
 
-        assert!(tester.ac_bus_1_output().is_unpowered());
-        assert!(tester.ac_bus_2_output().is_unpowered());
+        assert!(tester.ac_bus_1_output_potential().is_unpowered());
+        assert!(tester.ac_bus_2_output_potential().is_unpowered());
     }
 
     #[test]
@@ -2103,8 +2014,8 @@ mod a320_electrical_circuit_tests {
             .ext_pwr_off()
             .run();
 
-        assert!(tester.ac_bus_1_output().is_unpowered());
-        assert!(tester.ac_bus_2_output().is_unpowered());
+        assert!(tester.ac_bus_1_output_potential().is_unpowered());
+        assert!(tester.ac_bus_2_output_potential().is_unpowered());
     }
 
     #[test]
@@ -2148,14 +2059,14 @@ mod a320_electrical_circuit_tests {
     fn when_battery_1_has_charge_powers_hot_bus_1() {
         let tester = tester().run();
 
-        assert!(tester.hot_bus_1_output().is_powered());
+        assert!(tester.hot_bus_1_output_potential().is_powered());
     }
 
     #[test]
     fn when_battery_1_is_empty_and_dc_bat_bus_unpowered_hot_bus_1_unpowered() {
         let tester = tester_with().empty_battery_1().run();
 
-        assert!(tester.hot_bus_1_output().is_unpowered());
+        assert!(tester.hot_bus_1_output_potential().is_unpowered());
     }
 
     #[test]
@@ -2167,8 +2078,8 @@ mod a320_electrical_circuit_tests {
             .run();
 
         assert_eq!(
-            tester.hot_bus_1_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.hot_bus_1_output_potential(),
+            Potential::TransformerRectifier(1)
         );
     }
 
@@ -2206,14 +2117,14 @@ mod a320_electrical_circuit_tests {
     fn when_battery_2_has_charge_powers_hot_bus_2() {
         let tester = tester().run();
 
-        assert!(tester.hot_bus_2_output().is_powered());
+        assert!(tester.hot_bus_2_output_potential().is_powered());
     }
 
     #[test]
     fn when_battery_2_is_empty_and_dc_bat_bus_unpowered_hot_bus_2_unpowered() {
         let tester = tester_with().empty_battery_2().run();
 
-        assert!(tester.hot_bus_2_output().is_unpowered());
+        assert!(tester.hot_bus_2_output_potential().is_unpowered());
     }
 
     #[test]
@@ -2225,8 +2136,8 @@ mod a320_electrical_circuit_tests {
             .run();
 
         assert_eq!(
-            tester.hot_bus_2_output(),
-            Current::some(ElectricPowerSource::TransformerRectifier(1))
+            tester.hot_bus_2_output_potential(),
+            Potential::TransformerRectifier(1)
         );
     }
 
@@ -2234,22 +2145,22 @@ mod a320_electrical_circuit_tests {
     fn when_bus_tie_off_engine_1_does_not_power_ac_bus_2() {
         let tester = tester_with().running_engine_1().and().bus_tie_off().run();
 
-        assert!(tester.ac_bus_2_output().is_unpowered());
+        assert!(tester.ac_bus_2_output_potential().is_unpowered());
     }
 
     #[test]
     fn when_bus_tie_off_engine_2_does_not_power_ac_bus_1() {
         let tester = tester_with().running_engine_2().and().bus_tie_off().run();
 
-        assert!(tester.ac_bus_1_output().is_unpowered());
+        assert!(tester.ac_bus_1_output_potential().is_unpowered());
     }
 
     #[test]
     fn when_bus_tie_off_apu_does_not_power_ac_buses() {
         let tester = tester_with().running_apu().and().bus_tie_off().run();
 
-        assert!(tester.ac_bus_1_output().is_unpowered());
-        assert!(tester.ac_bus_2_output().is_unpowered());
+        assert!(tester.ac_bus_1_output_potential().is_unpowered());
+        assert!(tester.ac_bus_2_output_potential().is_unpowered());
     }
 
     #[test]
@@ -2260,8 +2171,8 @@ mod a320_electrical_circuit_tests {
             .bus_tie_off()
             .run();
 
-        assert!(tester.ac_bus_1_output().is_unpowered());
-        assert!(tester.ac_bus_2_output().is_unpowered());
+        assert!(tester.ac_bus_1_output_potential().is_unpowered());
+        assert!(tester.ac_bus_2_output_potential().is_unpowered());
     }
 
     #[test]
@@ -2285,6 +2196,75 @@ mod a320_electrical_circuit_tests {
         assert!(tester.ac_ess_feed_has_fault());
     }
 
+    #[test]
+    fn when_single_engine_and_apu_galley_is_not_shed() {
+        let tester = tester_with().running_engine_1().and().running_apu().run();
+
+        assert!(!tester.galley_is_shed());
+    }
+
+    #[test]
+    fn when_single_engine_gen_galley_is_shed() {
+        let tester = tester_with().running_engine_1().run();
+
+        assert!(tester.galley_is_shed());
+    }
+
+    #[test]
+    fn when_on_ground_and_apu_gen_only_galley_is_not_shed() {
+        let tester = tester_with().running_apu().and().on_the_ground().run();
+
+        assert!(!tester.galley_is_shed());
+    }
+
+    #[test]
+    fn when_on_ground_and_ext_pwr_only_galley_is_not_shed() {
+        let tester = tester_with()
+            .connected_external_power()
+            .ext_pwr_on()
+            .and()
+            .on_the_ground()
+            .run();
+
+        assert!(!tester.galley_is_shed());
+    }
+
+    #[test]
+    fn when_in_flight_and_apu_gen_only_galley_is_shed() {
+        let tester = tester_with().running_apu().run();
+
+        assert!(tester.galley_is_shed());
+    }
+
+    #[test]
+    fn when_in_flight_and_emer_gen_only_galley_is_shed() {
+        let tester = tester_with().running_emergency_generator().run();
+
+        assert!(tester.galley_is_shed());
+    }
+
+    #[test]
+    fn when_commercial_pb_off_galley_is_shed() {
+        let tester = tester_with().running_engines().and().commercial_off().run();
+
+        assert!(tester.galley_is_shed());
+    }
+
+    #[test]
+    fn when_galy_and_cab_pb_off_galley_is_shed() {
+        let tester = tester_with()
+            .running_engines()
+            .and()
+            .galy_and_cab_off()
+            .run();
+
+        assert!(tester.galley_is_shed());
+    }
+
+    #[test]
+    #[ignore = "Generator overloading is not yet supported."]
+    fn when_aircraft_on_the_ground_and_apu_gen_is_overloaded_galley_is_shed() {}
+
     fn tester_with() -> ElectricalCircuitTester {
         tester()
     }
@@ -2296,13 +2276,13 @@ mod a320_electrical_circuit_tests {
     struct ElectricalCircuitTester {
         engine1: Engine,
         engine2: Engine,
-        apu: AuxiliaryPowerUnit,
+        apu: AuxiliaryPowerUnit<Aps3200ApuGenerator>,
         ext_pwr: ExternalPowerSource,
         hyd: A320Hydraulic,
         elec: A320Electrical,
         overhead: A320ElectricalOverheadPanel,
         airspeed: Velocity,
-        above_ground_level: Length,
+        altitude: Length,
     }
 
     impl ElectricalCircuitTester {
@@ -2310,13 +2290,13 @@ mod a320_electrical_circuit_tests {
             ElectricalCircuitTester {
                 engine1: ElectricalCircuitTester::new_stopped_engine(),
                 engine2: ElectricalCircuitTester::new_stopped_engine(),
-                apu: stopped_apu(),
+                apu: AuxiliaryPowerUnitFactory::new_shutdown_aps3200(1),
                 ext_pwr: ElectricalCircuitTester::new_disconnected_external_power(),
                 hyd: A320Hydraulic::new(),
                 elec: A320Electrical::new(),
                 overhead: A320ElectricalOverheadPanel::new(),
                 airspeed: Velocity::new::<knot>(250.),
-                above_ground_level: Length::new::<foot>(5000.),
+                altitude: Length::new::<foot>(5000.),
             }
         }
 
@@ -2335,7 +2315,7 @@ mod a320_electrical_circuit_tests {
         }
 
         fn running_apu(mut self) -> ElectricalCircuitTester {
-            self.apu = running_apu();
+            self.apu = AuxiliaryPowerUnitFactory::new_running_aps3200(1);
             self
         }
 
@@ -2360,7 +2340,7 @@ mod a320_electrical_circuit_tests {
         }
 
         fn on_the_ground(mut self) -> ElectricalCircuitTester {
-            self.above_ground_level = Length::new::<foot>(0.);
+            self.altitude = Length::new::<foot>(0.);
             self
         }
 
@@ -2388,17 +2368,17 @@ mod a320_electrical_circuit_tests {
         }
 
         fn gen_1_off(mut self) -> ElectricalCircuitTester {
-            self.overhead.gen_1.turn_off();
+            self.overhead.gen_1.push_off();
             self
         }
 
         fn gen_2_off(mut self) -> ElectricalCircuitTester {
-            self.overhead.gen_2.turn_off();
+            self.overhead.gen_2.push_off();
             self
         }
 
         fn apu_gen_off(mut self) -> ElectricalCircuitTester {
-            self.overhead.apu_gen.turn_off();
+            self.overhead.apu_gen.push_off();
             self
         }
 
@@ -2447,76 +2427,92 @@ mod a320_electrical_circuit_tests {
             self
         }
 
-        fn ac_bus_1_output(&self) -> Current {
-            self.elec.alternating_current.ac_bus_1.output()
+        fn commercial_off(mut self) -> ElectricalCircuitTester {
+            self.overhead.commercial.push_off();
+            self
         }
 
-        fn ac_bus_2_output(&self) -> Current {
-            self.elec.alternating_current.ac_bus_2.output()
+        fn galy_and_cab_off(mut self) -> ElectricalCircuitTester {
+            self.overhead.galy_and_cab.push_off();
+            self
         }
 
-        fn ac_ess_bus_output(&self) -> Current {
-            self.elec.alternating_current.ac_ess_bus.output()
+        fn ac_bus_1_output_potential(&self) -> Potential {
+            self.elec.alternating_current.ac_bus_1.output_potential()
         }
 
-        fn ac_ess_shed_bus_output(&self) -> Current {
-            self.elec.alternating_current.ac_ess_shed_bus.output()
+        fn ac_bus_2_output_potential(&self) -> Potential {
+            self.elec.alternating_current.ac_bus_2.output_potential()
         }
 
-        fn ac_stat_inv_bus_output(&self) -> Current {
-            self.elec.alternating_current.ac_stat_inv_bus.output()
+        fn ac_ess_bus_output_potential(&self) -> Potential {
+            self.elec.alternating_current.ac_ess_bus.output_potential()
         }
 
-        fn static_inverter_input(&self) -> Current {
-            self.elec.direct_current.static_inverter.get_input()
+        fn ac_ess_shed_bus_output_potential(&self) -> Potential {
+            self.elec
+                .alternating_current
+                .ac_ess_shed_bus
+                .output_potential()
         }
 
-        fn tr_1_input(&self) -> Current {
-            self.elec.alternating_current.tr_1.get_input()
+        fn ac_stat_inv_bus_output_potential(&self) -> Potential {
+            self.elec
+                .alternating_current
+                .ac_stat_inv_bus
+                .output_potential()
         }
 
-        fn tr_2_input(&self) -> Current {
-            self.elec.alternating_current.tr_2.get_input()
+        fn static_inverter_input(&self) -> Potential {
+            self.elec.direct_current.static_inverter.input_potential()
         }
 
-        fn tr_ess_input(&self) -> Current {
-            self.elec.alternating_current.tr_ess.get_input()
+        fn tr_1_input(&self) -> Potential {
+            self.elec.alternating_current.tr_1.input_potential()
         }
 
-        fn dc_bus_1_output(&self) -> Current {
-            self.elec.direct_current.dc_bus_1.output()
+        fn tr_2_input(&self) -> Potential {
+            self.elec.alternating_current.tr_2.input_potential()
         }
 
-        fn dc_bus_2_output(&self) -> Current {
-            self.elec.direct_current.dc_bus_2.output()
+        fn tr_ess_input(&self) -> Potential {
+            self.elec.alternating_current.tr_ess.input_potential()
         }
 
-        fn dc_bat_bus_output(&self) -> Current {
-            self.elec.direct_current.dc_bat_bus.output()
+        fn dc_bus_1_output_potential(&self) -> Potential {
+            self.elec.direct_current.dc_bus_1.output_potential()
         }
 
-        fn dc_ess_bus_output(&self) -> Current {
-            self.elec.direct_current.dc_ess_bus.output()
+        fn dc_bus_2_output_potential(&self) -> Potential {
+            self.elec.direct_current.dc_bus_2.output_potential()
         }
 
-        fn dc_ess_shed_bus_output(&self) -> Current {
-            self.elec.direct_current.dc_ess_shed_bus.output()
+        fn dc_bat_bus_output_potential(&self) -> Potential {
+            self.elec.direct_current.dc_bat_bus.output_potential()
         }
 
-        fn battery_1_input(&self) -> Current {
-            self.elec.direct_current.battery_1.get_input()
+        fn dc_ess_bus_output_potential(&self) -> Potential {
+            self.elec.direct_current.dc_ess_bus.output_potential()
         }
 
-        fn battery_2_input(&self) -> Current {
-            self.elec.direct_current.battery_2.get_input()
+        fn dc_ess_shed_bus_output_potential(&self) -> Potential {
+            self.elec.direct_current.dc_ess_shed_bus.output_potential()
         }
 
-        fn hot_bus_1_output(&self) -> Current {
-            self.elec.direct_current.hot_bus_1.output()
+        fn battery_1_input(&self) -> Potential {
+            self.elec.direct_current.battery_1.input_potential()
         }
 
-        fn hot_bus_2_output(&self) -> Current {
-            self.elec.direct_current.hot_bus_2.output()
+        fn battery_2_input(&self) -> Potential {
+            self.elec.direct_current.battery_2.input_potential()
+        }
+
+        fn hot_bus_1_output_potential(&self) -> Potential {
+            self.elec.direct_current.hot_bus_1.output_potential()
+        }
+
+        fn hot_bus_2_output_potential(&self) -> Potential {
+            self.elec.direct_current.hot_bus_2.output_potential()
         }
 
         fn ac_ess_feed_has_fault(&self) -> bool {
@@ -2525,6 +2521,10 @@ mod a320_electrical_circuit_tests {
 
         fn create_power_supply(&self) -> PowerSupply {
             self.elec.create_power_supply()
+        }
+
+        fn galley_is_shed(&self) -> bool {
+            self.elec.galley_is_shed()
         }
 
         fn both_ac_ess_feed_contactors_open(&self) -> bool {
@@ -2546,14 +2546,14 @@ mod a320_electrical_circuit_tests {
         }
 
         fn run(mut self) -> ElectricalCircuitTester {
-            let context = UpdateContext::new(
-                Duration::from_secs(1),
-                self.airspeed,
-                self.above_ground_level,
-                ThermodynamicTemperature::new::<degree_celsius>(0.),
-            );
+            let context_builder = context_with()
+                .delta(Duration::from_secs(1))
+                .indicated_airspeed(self.airspeed)
+                .indicated_altitude(self.altitude)
+                .is_on_ground(self.altitude < Length::new::<foot>(1.))
+                .ambient_temperature(ThermodynamicTemperature::new::<degree_celsius>(0.));
             self.elec.update(
-                &context,
+                &context_builder.build(),
                 &self.engine1,
                 &self.engine2,
                 &self.apu,
@@ -2569,14 +2569,14 @@ mod a320_electrical_circuit_tests {
         fn run_waiting_for(mut self, delta: Duration) -> ElectricalCircuitTester {
             // Firstly run without any time passing at all, such that if the DelayedTrueLogicGate reaches
             // the true state after waiting for the given time it will be reflected in its output.
-            let context = UpdateContext::new(
-                Duration::from_secs(0),
-                self.airspeed,
-                self.above_ground_level,
-                ThermodynamicTemperature::new::<degree_celsius>(0.),
-            );
+            let mut context_builder = context_with()
+                .delta(Duration::from_secs(0))
+                .indicated_airspeed(self.airspeed)
+                .indicated_altitude(self.altitude)
+                .is_on_ground(self.altitude < Length::new::<foot>(1.))
+                .ambient_temperature(ThermodynamicTemperature::new::<degree_celsius>(0.));
             self.elec.update(
-                &context,
+                &context_builder.build(),
                 &self.engine1,
                 &self.engine2,
                 &self.apu,
@@ -2585,14 +2585,9 @@ mod a320_electrical_circuit_tests {
                 &self.overhead,
             );
 
-            let context = UpdateContext::new(
-                delta,
-                self.airspeed,
-                self.above_ground_level,
-                ThermodynamicTemperature::new::<degree_celsius>(0.),
-            );
+            context_builder = context_builder.delta(delta);
             self.elec.update(
-                &context,
+                &context_builder.build(),
                 &self.engine1,
                 &self.engine2,
                 &self.apu,
