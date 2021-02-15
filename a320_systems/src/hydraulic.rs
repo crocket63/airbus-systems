@@ -6,10 +6,16 @@ use uom::si::{
     volume::cubic_inch, volume::gallon, volume::liter, volume_rate::cubic_meter_per_second,
     volume_rate::gallon_per_second,
 };
-use crate::{engine::Engine, hydraulic::{ElectricPump, EngineDrivenPump, HydFluid, HydLoop, LoopColor, PressureSource, Ptu, Pump, RatPump}, overhead::{OnOffFaultPushButton}, shared::DelayedTrueLogicGate, simulator::UpdateContext};
-//use systems::simulation::UpdateContext;
+
+
+//use crate::{ hydraulic::{ElectricPump, EngineDrivenPump, HydFluid, HydLoop, LoopColor, PressureSource, Ptu, Pump, RatPump}, overhead::{OnOffFaultPushButton}, shared::DelayedTrueLogicGate};
+use systems::simulation::{SimulationElement, SimulationElementVisitor, SimulatorWriter, SimulatorReader, UpdateContext};
+use systems::engine::Engine;
+use systems::hydraulic::{ElectricPump,EngineDrivenPump, HydFluid, HydLoop, LoopColor, Ptu, PressureSource};
+use systems::overhead::{AutoOffFaultPushButton,OnOffFaultPushButton};
 
 pub struct A320Hydraulic {
+    hyd_logic_inputs : A320HydraulicLogic,
     blue_loop: HydLoop,
     green_loop: HydLoop,
     yellow_loop: HydLoop,
@@ -32,14 +38,14 @@ impl A320Hydraulic {
 
     pub fn new() -> A320Hydraulic {
         A320Hydraulic {
-
+            hyd_logic_inputs : A320HydraulicLogic::new(),
             blue_loop: HydLoop::new(
                 LoopColor::Blue,
                 false,
                 false,
-                Volume::new::<gallon>(1.5),
-                Volume::new::<gallon>(1.6),
-                Volume::new::<gallon>(1.6),
+                Volume::new::<gallon>(15.85),
+                Volume::new::<gallon>(15.85),
+                Volume::new::<gallon>(8.0),
                 Volume::new::<gallon>(1.5),
                 HydFluid::new(Pressure::new::<pascal>(1450000000.0)),
             ),
@@ -86,7 +92,7 @@ impl A320Hydraulic {
         self.yellow_loop.get_pressure().get::<psi>() >= A320Hydraulic::MIN_PRESS_PRESSURISED
     }
 
-    pub fn update(&mut self, ct: &UpdateContext, engine1 : &Engine, engine2 : &Engine) {
+    pub fn update(&mut self, ct: &UpdateContext, engine1 : &Engine, engine2 : &Engine, overhead_panel: &A320HydraulicOverheadPanel) {
 
         let min_hyd_loop_timestep = Duration::from_millis(A320Hydraulic::HYDRAULIC_SIM_TIME_STEP); //Hyd Sim rate = 10 Hz
 
@@ -103,20 +109,19 @@ impl A320Hydraulic {
 
         self.debug_refresh_duration+=ct.delta;
         if self.debug_refresh_duration > Duration::from_secs_f64(0.3) {
-            // println!("---HYDRAULIC UPDATE : t={}", self.total_sim_time_elapsed.as_secs_f64());
-            // println!("---G: {:.0} B: {:.0} Y: {:.0}", self.green_loop.get_pressure().get::<psi>(),self.blue_loop.get_pressure().get::<psi>(),self.yellow_loop.get_pressure().get::<psi>());
-            // println!("---EDP1 n2={} EDP2 n2={}", engine1.n2.get::<percent>(), engine2.n2.get::<percent>());
-            // println!("---EDP1 flowMax={:.1}gpm EDP2 flowMax={:.1}gpm", (self.engine_driven_pump_1.get_delta_vol_max().get::<gallon>() / min_hyd_loop_timestep.as_secs_f64() )* 60.0, (self.engine_driven_pump_2.get_delta_vol_max().get::<gallon>()/min_hyd_loop_timestep.as_secs_f64())*60.0);
+            println!("---HYDRAULIC UPDATE : t={}", self.total_sim_time_elapsed.as_secs_f64());
+            println!("---G: {:.0} B: {:.0} Y: {:.0}", self.green_loop.get_pressure().get::<psi>(),self.blue_loop.get_pressure().get::<psi>(),self.yellow_loop.get_pressure().get::<psi>());
+            println!("---EDP1 n2={} EDP2 n2={}", engine1.n2.get::<percent>(), engine2.n2.get::<percent>());
+            println!("---EDP1 flowMax={:.1}gpm EDP2 flowMax={:.1}gpm", (self.engine_driven_pump_1.get_delta_vol_max().get::<gallon>() / min_hyd_loop_timestep.as_secs_f64() )* 60.0, (self.engine_driven_pump_2.get_delta_vol_max().get::<gallon>()/min_hyd_loop_timestep.as_secs_f64())*60.0);
 
-            //println!("---steps required: {:.2}", number_of_steps_f64);
+            println!("---steps required: {:.2}", number_of_steps_f64);
             self.debug_refresh_duration= Duration::from_secs_f64(0.0);
         }
 
         if number_of_steps_f64 < 1.0 {
             //Can't do a full time step
             //we can either do an update with smaller step or wait next iteration
-            //Other option is to update only actuator position based on known hydraulic
-            //state to avoid lag of control surfaces if sim runs really fast
+
             self.lag_time_accumulator=Duration::from_secs_f64(number_of_steps_f64 * min_hyd_loop_timestep.as_secs_f64()); //Time lag is float part of num of steps * fixed time step to get a result in time
         } else {
             //TRUE UPDATE LOOP HERE
@@ -125,8 +130,12 @@ impl A320Hydraulic {
             self.lag_time_accumulator= Duration::from_secs_f64((number_of_steps_f64 - (num_of_update_loops as f64))* min_hyd_loop_timestep.as_secs_f64()); //Keep track of time left after all fixed loop are done
 
 
+            //Updating inputs through logic implementation (done out of update loop as it won't change if multiple loops)
+            self.update_hyd_logic_inputs (&ct,&overhead_panel);
+
             //UPDATING HYDRAULICS AT FIXED STEP
-            for curLoop in  0..num_of_update_loops {
+            for cur_loop in  0..num_of_update_loops {
+
                 //UPDATE HYDRAULICS FIXED TIME STEP
                 self.ptu.update(&self.green_loop, &self.yellow_loop);
                 self.engine_driven_pump_1.update(&min_hyd_loop_timestep,&ct, &self.green_loop, &engine1);
@@ -142,23 +151,136 @@ impl A320Hydraulic {
 
             //UPDATING ACTUATOR PHYSICS AT FIXED STEP / ACTUATORS_SIM_TIME_STEP_MULT
             let num_of_actuators_update_loops = num_of_update_loops * A320Hydraulic::ACTUATORS_SIM_TIME_STEP_MULT;
-            for curLoop in  0..num_of_actuators_update_loops {
+            for cur_loop in  0..num_of_actuators_update_loops {
                 //UPDATE ACTUATORS FIXED TIME STEP
             }
         }
     }
+
+    pub fn update_hyd_logic_inputs(&mut self, ct: &UpdateContext, overhead_panel: &A320HydraulicOverheadPanel){
+        if overhead_panel.edp1_push_button.is_auto(){
+            self.engine_driven_pump_1.start();
+        } else if overhead_panel.edp1_push_button.is_off() {
+            self.engine_driven_pump_1.stop();
+        }
+        if overhead_panel.edp2_push_button.is_auto(){
+            self.engine_driven_pump_2.start();
+        } else if overhead_panel.edp2_push_button.is_off() {
+            self.engine_driven_pump_2.stop();
+        }
+        if overhead_panel.yellow_epump_push_button.is_off(){
+            self.yellow_electric_pump.start();
+        } else  if overhead_panel.yellow_epump_push_button.is_on(){
+            self.yellow_electric_pump.stop();
+        }
+        if overhead_panel.blue_epump_push_button.is_auto(){
+            self.blue_electric_pump.start();
+        } else  if overhead_panel.blue_epump_push_button.is_off(){
+            self.blue_electric_pump.stop();
+        }
+
+        println!("---HYDRAULIC LOGIC : ParkB={}, ENg1 {}, ENg2 {}", self.hyd_logic_inputs.parking_brake_applied, self.hyd_logic_inputs.eng_1_master_on, self.hyd_logic_inputs.eng_2_master_on);
+        //TODO: keep cargo door condition true 40s after it is set to false
+        let ptu_inhibit = self.hyd_logic_inputs.cargo_door_operation && overhead_panel.yellow_epump_push_button.is_off(); //TODO check is_off here as it appeared reversed at first test
+        if overhead_panel.ptu_push_button.is_auto()
+            &&
+                (   self.hyd_logic_inputs.weight_on_wheels
+                ||  self.hyd_logic_inputs.eng_1_master_on && self.hyd_logic_inputs.eng_2_master_on
+                ||  !self.hyd_logic_inputs.eng_1_master_on && !self.hyd_logic_inputs.eng_2_master_on
+                ||  (
+                        !self.hyd_logic_inputs.parking_brake_applied
+                    &&
+                        !self.hyd_logic_inputs.nws_tow_engaged
+                    )
+                )
+                && !ptu_inhibit
+        {
+            self.ptu.enabling(true);
+        } else {
+            self.ptu.enabling(false);
+        }
+    }
 }
 
+
+impl SimulationElement for A320Hydraulic {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
+        visitor.visit(&mut self.hyd_logic_inputs);
+    }
+}
+
+
+
+pub struct A320HydraulicLogic {
+    parking_brake_applied : bool,
+    weight_on_wheels : bool,
+    eng_1_master_on : bool,
+    eng_2_master_on : bool,
+    nws_tow_engaged : bool,
+    cargo_door_operation : bool,
+}
+impl A320HydraulicLogic {
+    pub fn new() -> A320HydraulicLogic {
+        A320HydraulicLogic {
+            parking_brake_applied : true,
+            weight_on_wheels : true,
+            eng_1_master_on : false,
+            eng_2_master_on : false,
+            nws_tow_engaged : false,
+            cargo_door_operation : false,
+        }
+    }
+}
+
+impl SimulationElement for A320HydraulicLogic {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
+        visitor.visit(self);
+    }
+
+    fn read(&mut self, state: &mut SimulatorReader) {
+        self.parking_brake_applied = state.read_bool("PARK_BRAKE_ON");
+        self.eng_1_master_on = state.read_bool("ENG_MASTER_1");
+        self.eng_2_master_on = state.read_bool("ENG_MASTER_2");
+        self.weight_on_wheels = state.read_bool("SIM ON GROUND")
+    }
+}
+
+
+
 pub struct A320HydraulicOverheadPanel {
+    pub edp1_push_button: AutoOffFaultPushButton,
+    pub edp2_push_button: AutoOffFaultPushButton,
+    pub blue_epump_push_button: AutoOffFaultPushButton,
+    pub ptu_push_button: AutoOffFaultPushButton,
+    pub rat_push_button: OnOffFaultPushButton,
+    pub yellow_epump_push_button: OnOffFaultPushButton,
 }
 
 impl A320HydraulicOverheadPanel {
     pub fn new() -> A320HydraulicOverheadPanel {
         A320HydraulicOverheadPanel {
-
+            edp1_push_button: AutoOffFaultPushButton::new_auto("HYD_ENG1PUMP_TOGGLE"),
+            edp2_push_button: AutoOffFaultPushButton::new_auto("HYD_ENG2PUMP_TOGGLE"),
+            blue_epump_push_button : AutoOffFaultPushButton::new_auto("HYD_ELECPUMP_TOGGLE"),
+            ptu_push_button : AutoOffFaultPushButton::new_auto("HYD_PTU_TOGGLE"),
+            rat_push_button : OnOffFaultPushButton::new_off("HYD_RAT_SW"),
+            yellow_epump_push_button :OnOffFaultPushButton::new_off("HYD_ELECPUMPY_TOGGLE"),
         }
     }
 
     pub fn update(&mut self, context: &UpdateContext) {
+    }
+}
+
+impl SimulationElement for A320HydraulicOverheadPanel {
+    fn accept<T: SimulationElementVisitor>(&mut self, visitor: &mut T) {
+        self.edp1_push_button.accept(visitor);
+        self.edp2_push_button.accept(visitor);
+        self.blue_epump_push_button.accept(visitor);
+        self.ptu_push_button.accept(visitor);
+        self.rat_push_button.accept(visitor);
+        self.yellow_epump_push_button.accept(visitor);
+
+        visitor.visit(self);
     }
 }
