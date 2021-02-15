@@ -90,17 +90,17 @@ impl Aircraft for A320 {
         );
         self.electrical_overhead.update_after_elec(&self.electrical);
 
-        self.hydraulic.update(
-            context,
-            &self.engine_1,
-            &self.engine_2,
-        );
-
         let power_supply = self.electrical.create_power_supply();
         let mut power_consumption_handler = PowerConsumptionHandler::new(&power_supply);
         power_consumption_handler.supply_power_to_elements(&mut Box::new(self));
 
         // Update everything that needs to know if it is powered here.
+        self.hydraulic.update(
+            context,
+            &self.engine_1,
+            &self.engine_2,
+            &self.hydraulic_overhead,
+        );
 
         power_consumption_handler.determine_power_consumption(&mut Box::new(self));
         power_consumption_handler.write_power_consumption(&mut Box::new(self));
@@ -118,6 +118,8 @@ impl SimulatorElementVisitable for A320 {
         self.engine_2.accept(visitor);
         self.electrical.accept(visitor);
         self.ext_pwr.accept(visitor);
+        self.hydraulic.accept(visitor);
+        self.hydraulic_overhead.accept(visitor);
         visitor.visit(&mut Box::new(self));
     }
 }

@@ -39,6 +39,9 @@ struct A320SimulatorReadWriter {
     indicated_altitude: AircraftVariable,
     left_inner_tank_fuel_quantity: AircraftVariable,
     unlimited_fuel: AircraftVariable,
+    parking_brake: AircraftVariable,
+    master_eng_1: AircraftVariable,
+    master_eng_2: AircraftVariable,
 }
 impl A320SimulatorReadWriter {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -72,6 +75,9 @@ impl A320SimulatorReadWriter {
                 0,
             )?,
             unlimited_fuel: AircraftVariable::from("UNLIMITED FUEL", "Bool", 0)?,
+            parking_brake: AircraftVariable::from("BRAKE PARKING POSITION", "Bool", 1)?,
+            master_eng_1: AircraftVariable::from("TURB ENG MASTER STARTER SWITCH", "Bool", 2)?,
+            master_eng_2: AircraftVariable::from("TURB ENG MASTER STARTER SWITCH", "Bool", 2)?,
         })
     }
 }
@@ -91,6 +97,9 @@ impl SimulatorReadWriter for A320SimulatorReadWriter {
             "FUEL_UNLIMITED" => self.unlimited_fuel.get(),
             "INDICATED_AIRSPEED" => self.indicated_airspeed.get(),
             "INDICATED_ALTITUDE" => self.indicated_altitude.get(),
+            "ENG_MASTER_1" => self.master_eng_1.get(),
+            "ENG_MASTER_2" => self.master_eng_2.get(),
+            "PARK_BRAKE_ON" => self.parking_brake.get(),
             _ => {
                 lookup_named_variable(&mut self.dynamic_named_variables, "A32NX_", name).get_value()
             }

@@ -541,7 +541,8 @@ impl HydLoop {
         //Loop Pressure update From Bulk modulus
         let pressDelta = self.delta_pressure_from_delta_volume(delta_vol);
         // println!("---Press delta {}", pressDelta.get::<psi>());
-        self.loop_pressure += pressDelta.max(Pressure::new::<psi>(1.0)); //Just ensuring we don't go in negative press
+        self.loop_pressure += pressDelta; //Just ensuring we don't go in negative press
+        self.loop_pressure = self.loop_pressure.max(Pressure::new::<psi>(14.7));
         // println!("---Final press {}", self.loop_pressure.get::<psi>());
 
 
@@ -569,14 +570,16 @@ pub struct Pump {
     delta_vol_min: Volume,
     pressBreakpoints:[f64; 9] ,
     displacementCarac:[f64; 9] ,
+    displacement_dynamic: f64, //Displacement low pass filter. [0:1], 0 frozen -> 1 instantaneous dynamic
 }
 impl Pump {
-    fn new(pressBreakpoints:[f64; 9],displacementCarac:[f64; 9]) -> Pump {
+    fn new(pressBreakpoints:[f64; 9],displacementCarac:[f64; 9],displacement_dynamic:f64) -> Pump {
         Pump {
             delta_vol_max: Volume::new::<gallon>(0.),
             delta_vol_min: Volume::new::<gallon>(0.),
             pressBreakpoints:pressBreakpoints,
             displacementCarac:displacementCarac,
+            displacement_dynamic:displacement_dynamic,
         }
     }
 
@@ -585,7 +588,7 @@ impl Pump {
 
         let flow = Pump::calculate_flow(rpm, displacement);
 
-        self.delta_vol_max=flow * Time::new::<second>(delta_time.as_secs_f64());
+        self.delta_vol_max= (1.0 - self.displacement_dynamic)*self.delta_vol_max + self.displacement_dynamic * flow * Time::new::<second>(delta_time.as_secs_f64());
         self.delta_vol_min=Volume::new::<gallon>(0.0);
     }
 
@@ -622,12 +625,13 @@ impl ElectricPump {
     const DISPLACEMENT_MAP: [f64; 9] = [
         0.263,0.263,0.263,  0.263 , 0.263,  0.263 , 0.163,  0.0 ,   0.0
     ];
+    const DISPLACEMENT_DYNAMICS: f64 = 1.0; //1 == No filtering
 
     pub fn new() -> ElectricPump {
         ElectricPump {
             active: false,
             rpm: 0.,
-            pump: Pump::new(ElectricPump::DISPLACEMENT_BREAKPTS,ElectricPump::DISPLACEMENT_MAP),
+            pump: Pump::new(ElectricPump::DISPLACEMENT_BREAKPTS,ElectricPump::DISPLACEMENT_MAP,ElectricPump::DISPLACEMENT_DYNAMICS),
         }
     }
 
@@ -675,13 +679,15 @@ impl EngineDrivenPump {
     const DISPLACEMENT_MAP: [f64; 9] = [
         2.4 ,2.4,   2.4,    2.4 ,   2.4,    2.4 ,   2.0,    0.0 ,   0.0 ];
     const MAX_RPM: f64 = 4000.;
-    //const DISPLACEMENT_MAX_RATE_ON_OFF: f64 = 0.5; //Displacement rate when starting/stoping pump
+
+    const DISPLACEMENT_DYNAMICS: f64 = 0.05; //0.1 == 90% filtering on max displacement transient
 
     pub fn new() -> EngineDrivenPump {
         EngineDrivenPump {
             active: false,
             pump: Pump::new(EngineDrivenPump::DISPLACEMENT_BREAKPTS,
                 EngineDrivenPump::DISPLACEMENT_MAP,
+                EngineDrivenPump::DISPLACEMENT_DYNAMICS,
             ),
         }
     }
@@ -727,10 +733,12 @@ impl RatPump {
 
     const NORMAL_RPM: f64 = 6000.;
 
+    const DISPLACEMENT_DYNAMICS: f64 = 1.0; //1 == no filtering
+
     pub fn new() -> RatPump {
         RatPump {
             active: false,
-            pump: Pump::new(RatPump::DISPLACEMENT_BREAKPTS,RatPump::DISPLACEMENT_MAP),
+            pump: Pump::new(RatPump::DISPLACEMENT_BREAKPTS,RatPump::DISPLACEMENT_MAP, RatPump::DISPLACEMENT_DYNAMICS),
         }
     }
 
@@ -927,7 +935,7 @@ mod tests {
         let mut green_loop = hydraulic_loop(LoopColor::Green);
         edp1.active = true;
 
-        let init_n2 = Ratio::new::<percent>(0.5);
+        let init_n2 = Ratio::new::<percent>(55.0);
         let mut engine1 = engine(init_n2);
         let ct = context(Duration::from_millis(100));
 
@@ -943,7 +951,7 @@ mod tests {
             }
             if x == 200 {
                 assert!(green_loop.loop_pressure >= Pressure::new::<psi>(2950.0));
-                engine1.n2 = Ratio::new::<percent>(0.0);
+                edp1.stop();
             }
             if x >= 400 { //Shutdown + 20s
                 assert!(green_loop.loop_pressure <= Pressure::new::<psi>(50.0));
@@ -1098,6 +1106,48 @@ mod tests {
     }
 
     #[test]
+    //Runs electric pump, checks pressure OK, shut it down, check drop of pressure after 20s
+    fn blue_loop_epump_simulation() {
+        let mut epump = electric_pump();
+        let mut blue_loop = hydraulic_loop(LoopColor::Blue);
+        epump.active = true;
+
+        let ct = context(Duration::from_millis(100));
+        for x in 0..800 {
+            if x == 400 {
+                assert!(blue_loop.loop_pressure >= Pressure::new::<psi>(2800.0));
+                epump.active = false;
+            }
+
+            if x >= 600 { //X+200 after shutoff = X + 20seconds @ 100ms, so pressure shall be low
+                assert!(blue_loop.loop_pressure <= Pressure::new::<psi>(100.0));
+            }
+            epump.update(&ct.delta,&ct, &blue_loop);
+            blue_loop.update(&ct.delta,&ct, vec![&epump], Vec::new(), Vec::new(), Vec::new());
+            if x % 20 == 0 {
+                println!("Iteration {}", x);
+                println!("-------------------------------------------");
+                println!("---PSI: {}", blue_loop.loop_pressure.get::<psi>());
+                println!("---RPM: {}", epump.rpm);
+                println!(
+                    "--------Reservoir Volume (g): {}",
+                    blue_loop.reservoir_volume.get::<gallon>()
+                );
+                println!(
+                    "--------Loop Volume (g): {}",
+                    blue_loop.loop_volume.get::<gallon>()
+                );
+                println!(
+                    "--------Acc Volume (g): {}",
+                    blue_loop.accumulator_gas_volume.get::<gallon>()
+                );
+            }
+        }
+
+        assert!(true)
+    }
+
+    #[test]
     //Runs green edp and yellow epump, checks pressure OK,
     //shut green edp off, check drop of pressure and ptu effect
     //shut yellow epump, check drop of pressure in both loops
@@ -1116,7 +1166,7 @@ mod tests {
 
 
         let mut epump = electric_pump();
-        epump.active = false;
+        epump.stop();
         let mut yellow_loop = hydraulic_loop(LoopColor::Yellow);
 
         let mut edp1 = engine_driven_pump();
@@ -1141,6 +1191,7 @@ mod tests {
 
         engine1.n2=Ratio::new::<percent>(100.0);
         for x in 0..800 {
+
             if x == 10 { //After 1s powering electric pump
                 println!("------------YELLOW EPUMP ON------------");
                 assert!(yellow_loop.loop_pressure <= Pressure::new::<psi>(50.0));
@@ -1149,7 +1200,7 @@ mod tests {
                 assert!(green_loop.loop_pressure <= Pressure::new::<psi>(50.0));
                 assert!(green_loop.reservoir_volume  == green_res_at_start);
 
-                epump.active = true;
+                epump.start();
             }
 
             if x == 110 { //10s later enabling ptu
@@ -1188,7 +1239,7 @@ mod tests {
                assert!(yellow_loop.loop_pressure >= Pressure::new::<psi>(2900.0));
                assert!(green_loop.loop_pressure >= Pressure::new::<psi>(2900.0));
                 edp1.stop();
-                epump.active = false;
+                // epump.active = false;
             }
 
             if x == 800 { //@80s diabling edp and epump
@@ -1263,11 +1314,11 @@ mod tests {
                 loop_color,
                 false,
                 false,
-                Volume::new::<gallon>(15.7),
                 Volume::new::<gallon>(15.85),
-                Volume::new::<gallon>(10.0),
-                Volume::new::<gallon>(1.70),
-                HydFluid::new(Pressure::new::<pascal>(1450000000.0))
+                Volume::new::<gallon>(15.85),
+                Volume::new::<gallon>(8.0),
+                Volume::new::<gallon>(1.5),
+                HydFluid::new(Pressure::new::<pascal>(1450000000.0)),
             )
         }
     }
@@ -1378,15 +1429,19 @@ mod tests {
         }
 
         #[test]
+        //TODO broken until rpm relation repaired
         fn engine_d_pump_charac(){
             let mut outputCaracteristics : Vec<PressureCaracteristic> = Vec::new();
             let mut edpump = EngineDrivenPump::new();
-            let context = context(Duration::from_secs_f64(0.0001) ); //Small dt to freeze spool up effect
+            //let context = context(Duration::from_secs_f64(0.0001) ); //Small dt to freeze spool up effect
 
             let mut green_loop = hydraulic_loop(LoopColor::Green);
             let mut engine1 = engine(Ratio::new::<percent>(0.0));
 
-            //edpump.start();
+            edpump.start();
+            let context = context(Duration::from_secs_f64(1.0) ); //Small dt to freeze spool up effect
+
+            edpump.update(&context.delta, &context, &green_loop,&engine1);
             for pressure in (0..3500).step_by(500) {
                 let mut rpmTab: Vec<f64> = Vec::new();
                 let mut flowTab: Vec<f64> = Vec::new();
