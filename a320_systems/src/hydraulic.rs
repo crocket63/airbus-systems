@@ -394,7 +394,7 @@ pub mod tests {
 
 
     use super::A320HydraulicOverheadPanel;
-    use crate::A320HydraulicLogic;
+    use super::A320HydraulicLogic;
     use crate::UpdateContext;
 
     fn overhead() -> A320HydraulicOverheadPanel {
@@ -421,13 +421,12 @@ pub mod tests {
         let mut overhead = overhead();
         let mut logic = hyd_logic();
 
-        let ct = context(Duration::from_secs_f64(0.08));
-
-        assert!( !logic.is_nsw_pin_inserted_flag(&ct) );
+        let update_delta = Duration::from_secs_f64(0.08);
+        assert!( !logic.is_nsw_pin_inserted_flag(&update_delta) );
 
         logic.pushback_angle = 1.001;
         logic.pushback_state = 2.0;
-        assert!( logic.is_nsw_pin_inserted_flag(&ct) );
+        assert!( logic.is_nsw_pin_inserted_flag(&update_delta) );
 
     }
 }
