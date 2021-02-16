@@ -130,11 +130,11 @@ impl A320Hydraulic {
             self.lag_time_accumulator= Duration::from_secs_f64((number_of_steps_f64 - (num_of_update_loops as f64))* min_hyd_loop_timestep.as_secs_f64()); //Keep track of time left after all fixed loop are done
 
 
-            //Updating inputs through logic implementation (done out of update loop as it won't change if multiple loops)
-            self.update_hyd_logic_inputs (&ct,&overhead_panel);
-
             //UPDATING HYDRAULICS AT FIXED STEP
             for cur_loop in  0..num_of_update_loops {
+
+                //Base logic update based on overhead Could be done only once (before that loop) but if so delta time should be set accordingly
+                self.update_hyd_logic_inputs (&min_hyd_loop_timestep,&overhead_panel);
 
                 //UPDATE HYDRAULICS FIXED TIME STEP
                 self.ptu.update(&self.green_loop, &self.yellow_loop);
@@ -157,7 +157,17 @@ impl A320Hydraulic {
         }
     }
 
-    pub fn update_hyd_logic_inputs(&mut self, ct: &UpdateContext, overhead_panel: &A320HydraulicOverheadPanel){
+    pub fn update_hyd_logic_inputs(&mut self, delta_time_update : &Duration, overhead_panel: &A320HydraulicOverheadPanel){
+
+        let mut cargo_operated= false;
+        let mut nsw_pin_inserted = false;
+
+        //Only evaluate ground conditions if on ground, if superman need to operate cargo door in flight feel free to update
+        if self.hyd_logic_inputs.weight_on_wheels {
+            cargo_operated=  self.hyd_logic_inputs.is_cargo_operation_flag(&delta_time_update);
+            nsw_pin_inserted = self.hyd_logic_inputs.is_nsw_pin_inserted_flag(&delta_time_update);
+        }
+
         if overhead_panel.edp1_push_button.is_auto(){
             self.engine_driven_pump_1.start();
         } else if overhead_panel.edp1_push_button.is_off() {
@@ -168,20 +178,40 @@ impl A320Hydraulic {
         } else if overhead_panel.edp2_push_button.is_off() {
             self.engine_driven_pump_2.stop();
         }
-        if overhead_panel.yellow_epump_push_button.is_off(){
+        if overhead_panel.yellow_epump_push_button.is_off()
+        ||
+        cargo_operated
+        {
             self.yellow_electric_pump.start();
-        } else  if overhead_panel.yellow_epump_push_button.is_on(){
+        } else if overhead_panel.yellow_epump_push_button.is_auto(){
             self.yellow_electric_pump.stop();
         }
         if overhead_panel.blue_epump_push_button.is_auto(){
-            self.blue_electric_pump.start();
+            if      self.hyd_logic_inputs.eng_1_master_on
+                ||  self.hyd_logic_inputs.eng_2_master_on
+                ||  overhead_panel.blue_epump_override_push_button.is_on() {
+
+                        self.blue_electric_pump.start();
+            } else {
+                self.blue_electric_pump.stop();
+            }
         } else  if overhead_panel.blue_epump_push_button.is_off(){
             self.blue_electric_pump.stop();
         }
 
-        println!("---HYDRAULIC LOGIC : ParkB={}, ENg1 {}, ENg2 {}", self.hyd_logic_inputs.parking_brake_applied, self.hyd_logic_inputs.eng_1_master_on, self.hyd_logic_inputs.eng_2_master_on);
-        //TODO: keep cargo door condition true 40s after it is set to false
-        let ptu_inhibit = self.hyd_logic_inputs.cargo_door_operation && overhead_panel.yellow_epump_push_button.is_off(); //TODO check is_off here as it appeared reversed at first test
+        println!("---HYDLOGIC : ParkB={}, ENg1M {}, ENg2M {} WoW={} Pinserted={} doorF={} doorB={} doorOperated={}",
+           self.hyd_logic_inputs.parking_brake_applied,
+           self.hyd_logic_inputs.eng_1_master_on,
+           self.hyd_logic_inputs.eng_2_master_on,
+           self.hyd_logic_inputs.weight_on_wheels,
+           nsw_pin_inserted,
+           self.hyd_logic_inputs.cargo_door_front_pos,
+           self.hyd_logic_inputs.cargo_door_back_pos,
+           cargo_operated
+        );
+
+        let ptu_inhibit = cargo_operated
+                                && overhead_panel.yellow_epump_push_button.is_auto(); //TODO is auto will change once auto/on button is created in overhead library
         if overhead_panel.ptu_push_button.is_auto()
             &&
                 (   self.hyd_logic_inputs.weight_on_wheels
@@ -190,7 +220,7 @@ impl A320Hydraulic {
                 ||  (
                         !self.hyd_logic_inputs.parking_brake_applied
                     &&
-                        !self.hyd_logic_inputs.nws_tow_engaged
+                        !nsw_pin_inserted
                     )
                 )
                 && !ptu_inhibit
@@ -216,19 +246,75 @@ pub struct A320HydraulicLogic {
     weight_on_wheels : bool,
     eng_1_master_on : bool,
     eng_2_master_on : bool,
-    nws_tow_engaged : bool,
-    cargo_door_operation : bool,
+    nws_tow_engaged_timer : Duration,
+    cargo_door_front_pos : f64,
+    cargo_door_back_pos : f64,
+    cargo_door_front_pos_prev : f64,
+    cargo_door_back_pos_prev : f64,
+    cargo_door_timer : Duration,
+    pushback_angle : f64,
+    pushback_angle_prev : f64,
+    pushback_state : f64,
 }
+
+//Implements low level logic for all hydraulics commands
 impl A320HydraulicLogic {
+    const CARGO_OPERATED_TIMEOUT_YPUMP :f64 = 40.0; //Timeout to shut off yellow epump after cargo operation
+    const NWS_PIN_REMOVE_TIMEOUT : f64 = 15.0; //Time for ground crew to remove pin after tow
+
     pub fn new() -> A320HydraulicLogic {
         A320HydraulicLogic {
             parking_brake_applied : true,
             weight_on_wheels : true,
             eng_1_master_on : false,
             eng_2_master_on : false,
-            nws_tow_engaged : false,
-            cargo_door_operation : false,
+            nws_tow_engaged_timer : Duration::from_secs_f64(0.0),
+            cargo_door_front_pos : 0.0,
+            cargo_door_back_pos : 0.0,
+            cargo_door_front_pos_prev : 0.0,
+            cargo_door_back_pos_prev : 0.0,
+            cargo_door_timer : Duration::from_secs_f64(0.0),
+            pushback_angle : 0.0,
+            pushback_angle_prev : 0.0,
+            pushback_state : 0.0,
         }
+    }
+
+    pub fn is_cargo_operation_flag (&mut self, delta_time_update : &Duration) -> bool {
+        let cargo_door_moved=  self.cargo_door_back_pos != self.cargo_door_back_pos_prev
+                                    ||
+                                    self.cargo_door_front_pos != self.cargo_door_front_pos_prev;
+
+        if cargo_door_moved {
+            self.cargo_door_timer = Duration::from_secs_f64(A320HydraulicLogic::CARGO_OPERATED_TIMEOUT_YPUMP);
+        } else {
+            if self.cargo_door_timer > *delta_time_update {
+                self.cargo_door_timer -= *delta_time_update;
+            } else {
+                self.cargo_door_timer = Duration::from_secs(0);
+            }
+        }
+
+        self.cargo_door_timer > Duration::from_secs_f64(0.0)
+    }
+
+    pub fn is_nsw_pin_inserted_flag (&mut self, delta_time_update : &Duration) -> bool {
+        let pushback_in_progress=  (self.pushback_angle != self.pushback_angle_prev)
+                                        &&
+                                        self.pushback_state != 3.0;
+
+
+        if pushback_in_progress {
+            self.nws_tow_engaged_timer = Duration::from_secs_f64(A320HydraulicLogic::NWS_PIN_REMOVE_TIMEOUT);
+        } else {
+            if self.nws_tow_engaged_timer > *delta_time_update {
+                self.nws_tow_engaged_timer -= *delta_time_update; //TODO CHECK if rollover issue to expect if not limiting to 0
+            } else {
+                self.nws_tow_engaged_timer = Duration::from_secs(0);
+            }
+        }
+
+        self.nws_tow_engaged_timer > Duration::from_secs(0)
     }
 }
 
@@ -239,9 +325,20 @@ impl SimulationElement for A320HydraulicLogic {
 
     fn read(&mut self, state: &mut SimulatorReader) {
         self.parking_brake_applied = state.read_bool("PARK_BRAKE_ON");
-        self.eng_1_master_on = state.read_bool("ENG_MASTER_1");
-        self.eng_2_master_on = state.read_bool("ENG_MASTER_2");
-        self.weight_on_wheels = state.read_bool("SIM ON GROUND")
+        self.eng_1_master_on = state.read_bool("ENG MASTER 1");
+        self.eng_2_master_on = state.read_bool("ENG MASTER 2");
+        self.weight_on_wheels = state.read_bool("SIM ON GROUND");
+
+        //Handling here of the previous values of cargo doors
+        self.cargo_door_front_pos_prev=self.cargo_door_front_pos;
+        self.cargo_door_front_pos = state.read_f64("CARGO FRONT POS");
+        self.cargo_door_back_pos_prev=self.cargo_door_back_pos;
+        self.cargo_door_back_pos = state.read_f64("CARGO BACK POS");
+
+        //Handling here of the previous values of pushback angle. Angle keeps moving while towed. Feel free to find better hack
+        self.pushback_angle_prev=self.pushback_angle;
+        self.pushback_angle = state.read_f64("PUSHBACK ANGLE");
+        self.pushback_state = state.read_f64("PUSHBACK STATE");
     }
 }
 
@@ -252,19 +349,21 @@ pub struct A320HydraulicOverheadPanel {
     pub edp2_push_button: AutoOffFaultPushButton,
     pub blue_epump_push_button: AutoOffFaultPushButton,
     pub ptu_push_button: AutoOffFaultPushButton,
-    pub rat_push_button: OnOffFaultPushButton,
-    pub yellow_epump_push_button: OnOffFaultPushButton,
+    pub rat_push_button: AutoOffFaultPushButton,
+    pub yellow_epump_push_button: AutoOffFaultPushButton,
+    pub blue_epump_override_push_button: OnOffFaultPushButton,
 }
 
 impl A320HydraulicOverheadPanel {
     pub fn new() -> A320HydraulicOverheadPanel {
         A320HydraulicOverheadPanel {
-            edp1_push_button: AutoOffFaultPushButton::new_auto("HYD_ENG1PUMP_TOGGLE"),
-            edp2_push_button: AutoOffFaultPushButton::new_auto("HYD_ENG2PUMP_TOGGLE"),
-            blue_epump_push_button : AutoOffFaultPushButton::new_auto("HYD_ELECPUMP_TOGGLE"),
-            ptu_push_button : AutoOffFaultPushButton::new_auto("HYD_PTU_TOGGLE"),
-            rat_push_button : OnOffFaultPushButton::new_off("HYD_RAT_SW"),
-            yellow_epump_push_button :OnOffFaultPushButton::new_off("HYD_ELECPUMPY_TOGGLE"),
+            edp1_push_button: AutoOffFaultPushButton::new_auto("HYD_ENG_1_PUMP"),
+            edp2_push_button: AutoOffFaultPushButton::new_auto("HYD_ENG_2_PUMP"),
+            blue_epump_push_button : AutoOffFaultPushButton::new_auto("HYD_EPUMPB"),
+            ptu_push_button : AutoOffFaultPushButton::new_auto("HYD_PTU"),
+            rat_push_button : AutoOffFaultPushButton::new_off("HYD_RAT"),
+            yellow_epump_push_button :AutoOffFaultPushButton::new_off("HYD_EPUMPY"),
+            blue_epump_override_push_button :OnOffFaultPushButton::new_off("HYD_EPUMPY_OVRD"),
         }
     }
 
@@ -280,7 +379,55 @@ impl SimulationElement for A320HydraulicOverheadPanel {
         self.ptu_push_button.accept(visitor);
         self.rat_push_button.accept(visitor);
         self.yellow_epump_push_button.accept(visitor);
+        self.blue_epump_override_push_button.accept(visitor);
 
         visitor.visit(self);
+    }
+}
+
+
+#[cfg(test)]
+pub mod tests {
+    use std::time::Duration;
+
+    use uom::si::{f64::*, length::foot, thermodynamic_temperature::degree_celsius, velocity::knot};
+
+
+    use super::A320HydraulicOverheadPanel;
+    use crate::A320HydraulicLogic;
+    use crate::UpdateContext;
+
+    fn overhead() -> A320HydraulicOverheadPanel {
+        A320HydraulicOverheadPanel::new()
+    }
+
+    fn hyd_logic() -> A320HydraulicLogic {
+        A320HydraulicLogic::new()
+    }
+
+    fn context(delta_time: Duration) -> UpdateContext {
+        UpdateContext::new(
+            delta_time,
+            Velocity::new::<knot>(0.),
+            Length::new::<foot>(2000.),
+            ThermodynamicTemperature::new::<degree_celsius>(25.0),
+            true,
+        )
+    }
+
+
+    #[test]
+    fn is_nws_pin_engaged_test() {
+        let mut overhead = overhead();
+        let mut logic = hyd_logic();
+
+        let ct = context(Duration::from_secs_f64(0.08));
+
+        assert!( !logic.is_nsw_pin_inserted_flag(&ct) );
+
+        logic.pushback_angle = 1.001;
+        logic.pushback_state = 2.0;
+        assert!( logic.is_nsw_pin_inserted_flag(&ct) );
+
     }
 }
