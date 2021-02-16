@@ -158,6 +158,16 @@ impl A320Hydraulic {
     }
 
     pub fn update_hyd_logic_inputs(&mut self, ct: &UpdateContext, overhead_panel: &A320HydraulicOverheadPanel){
+
+        let mut cargo_operated= false;
+        let mut nsw_pin_inserted = false;
+
+        //Only evaluate ground conditions if on ground, if superman need to operate cargo door in flight feel free to update
+        if self.hyd_logic_inputs.weight_on_wheels {
+            cargo_operated=  self.hyd_logic_inputs.is_cargo_operation_flag(&ct);
+            nsw_pin_inserted = self.hyd_logic_inputs.is_nsw_pin_inserted_flag(&ct);
+        }
+
         if overhead_panel.edp1_push_button.is_auto(){
             self.engine_driven_pump_1.start();
         } else if overhead_panel.edp1_push_button.is_off() {
@@ -168,7 +178,10 @@ impl A320Hydraulic {
         } else if overhead_panel.edp2_push_button.is_off() {
             self.engine_driven_pump_2.stop();
         }
-        if overhead_panel.yellow_epump_push_button.is_off(){
+        if overhead_panel.yellow_epump_push_button.is_off()
+        ||
+        cargo_operated
+        {
             self.yellow_electric_pump.start();
         } else  if overhead_panel.yellow_epump_push_button.is_on(){
             self.yellow_electric_pump.stop();
@@ -179,9 +192,18 @@ impl A320Hydraulic {
             self.blue_electric_pump.stop();
         }
 
-        println!("---HYDRAULIC LOGIC : ParkB={}, ENg1 {}, ENg2 {}", self.hyd_logic_inputs.parking_brake_applied, self.hyd_logic_inputs.eng_1_master_on, self.hyd_logic_inputs.eng_2_master_on);
-        //TODO: keep cargo door condition true 40s after it is set to false
-        let ptu_inhibit = self.hyd_logic_inputs.cargo_door_operation && overhead_panel.yellow_epump_push_button.is_off(); //TODO check is_off here as it appeared reversed at first test
+        println!("---HYDLOGIC : ParkB={}, ENg1M {}, ENg2M {} WoW={} Tow={} doorF={} doorB={}",
+         self.hyd_logic_inputs.parking_brake_applied,
+          self.hyd_logic_inputs.eng_1_master_on,
+           self.hyd_logic_inputs.eng_2_master_on,
+           self.hyd_logic_inputs.weight_on_wheels,
+           nsw_pin_inserted,
+           self.hyd_logic_inputs.cargo_door_front_pos,
+           self.hyd_logic_inputs.cargo_door_back_pos,
+        );
+
+        let ptu_inhibit = cargo_operated
+                                && overhead_panel.yellow_epump_push_button.is_off(); //TODO check is_off here as it appeared reversed at first test
         if overhead_panel.ptu_push_button.is_auto()
             &&
                 (   self.hyd_logic_inputs.weight_on_wheels
@@ -190,7 +212,7 @@ impl A320Hydraulic {
                 ||  (
                         !self.hyd_logic_inputs.parking_brake_applied
                     &&
-                        !self.hyd_logic_inputs.nws_tow_engaged
+                        !nsw_pin_inserted
                     )
                 )
                 && !ptu_inhibit
@@ -216,19 +238,67 @@ pub struct A320HydraulicLogic {
     weight_on_wheels : bool,
     eng_1_master_on : bool,
     eng_2_master_on : bool,
-    nws_tow_engaged : bool,
-    cargo_door_operation : bool,
+    nws_tow_engaged_timer : Duration,
+    cargo_door_front_pos : f64,
+    cargo_door_back_pos : f64,
+    cargo_door_front_pos_prev : f64,
+    cargo_door_back_pos_prev : f64,
+    cargo_door_timer : Duration,
+    pushback_angle : f64,
+    pushback_angle_prev : f64,
+    pushback_state : f64,
 }
+
+//Implements low level logic for all hydraulics commands
 impl A320HydraulicLogic {
+    const CARGO_OPERATED_TIMEOUT_YPUMP :f64 =0.0; //Timeout to shut off yellow epump after cargo operation
+    const NWS_PIN_REMOVE_TIMEOUT : f64 = 15.0; //Time for ground crew to remove pin after tow
+
     pub fn new() -> A320HydraulicLogic {
         A320HydraulicLogic {
             parking_brake_applied : true,
             weight_on_wheels : true,
             eng_1_master_on : false,
             eng_2_master_on : false,
-            nws_tow_engaged : false,
-            cargo_door_operation : false,
+            nws_tow_engaged_timer : Duration::from_secs_f64(0.0),
+            cargo_door_front_pos : 0.0,
+            cargo_door_back_pos : 0.0,
+            cargo_door_front_pos_prev : 0.0,
+            cargo_door_back_pos_prev : 0.0,
+            cargo_door_timer : Duration::from_secs_f64(0.0),
+            pushback_angle : 0.0,
+            pushback_angle_prev : 0.0,
+            pushback_state : 0.0,
         }
+    }
+
+    pub fn is_cargo_operation_flag (&mut self, ct :&UpdateContext) -> bool {
+        let cargo_door_moved=  self.cargo_door_back_pos != self.cargo_door_back_pos_prev
+                                    ||
+                                    self.cargo_door_front_pos != self.cargo_door_front_pos_prev;
+
+        if cargo_door_moved {
+            self.cargo_door_timer = Duration::from_secs_f64(A320HydraulicLogic::CARGO_OPERATED_TIMEOUT_YPUMP);
+        } else {
+            self.cargo_door_timer -= ct.delta; //TODO CHECK if rollover issue to expect if not limiting to 0
+        }
+
+        self.cargo_door_timer > Duration::from_secs_f64(0.0)
+    }
+
+    pub fn is_nsw_pin_inserted_flag (&mut self, ct :&UpdateContext) -> bool {
+        let pushback_in_progress=  (self.pushback_angle != self.pushback_angle_prev)
+                                        &&
+                                        self.pushback_state != 3.0;
+
+
+        if pushback_in_progress {
+            self.nws_tow_engaged_timer = Duration::from_secs_f64(A320HydraulicLogic::NWS_PIN_REMOVE_TIMEOUT);
+        } else {
+            self.nws_tow_engaged_timer -= ct.delta; //TODO CHECK if rollover issue to expect if not limiting to 0
+        }
+
+        self.nws_tow_engaged_timer > Duration::from_secs_f64(0.0)
     }
 }
 
@@ -239,9 +309,20 @@ impl SimulationElement for A320HydraulicLogic {
 
     fn read(&mut self, state: &mut SimulatorReader) {
         self.parking_brake_applied = state.read_bool("PARK_BRAKE_ON");
-        self.eng_1_master_on = state.read_bool("ENG_MASTER_1");
-        self.eng_2_master_on = state.read_bool("ENG_MASTER_2");
-        self.weight_on_wheels = state.read_bool("SIM ON GROUND")
+        self.eng_1_master_on = state.read_bool("ENG MASTER 1");
+        self.eng_2_master_on = state.read_bool("ENG MASTER 2");
+        self.weight_on_wheels = state.read_bool("SIM ON GROUND");
+
+        //Handling here of the previous values of cargo doors
+        self.cargo_door_front_pos_prev=self.cargo_door_front_pos;
+        self.cargo_door_front_pos = state.read_f64("CARGO FRONT POS");
+        self.cargo_door_back_pos_prev=self.cargo_door_back_pos;
+        self.cargo_door_back_pos = state.read_f64("CARGO BACK POS");
+
+        //Handling here of the previous values of pushback angle. Angle keeps moving while towed. Feel free to find better hack
+        self.pushback_angle_prev=self.pushback_angle;
+        self.pushback_angle = state.read_f64("PUSHBACK ANGLE");
+        self.pushback_state = state.read_f64("PUSHBACK STATE");
     }
 }
 

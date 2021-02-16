@@ -38,6 +38,10 @@ struct A320SimulatorReaderWriter {
     parking_brake: AircraftVariable,
     master_eng_1: AircraftVariable,
     master_eng_2: AircraftVariable,
+    cargo_door_front_pos :AircraftVariable,
+    cargo_door_back_pos : AircraftVariable,
+    pushback_angle : AircraftVariable,
+    pushback_state : AircraftVariable,
 }
 impl A320SimulatorReaderWriter {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
@@ -73,8 +77,12 @@ impl A320SimulatorReaderWriter {
             sim_on_ground: AircraftVariable::from("SIM ON GROUND", "Bool", 0)?,
             unlimited_fuel: AircraftVariable::from("UNLIMITED FUEL", "Bool", 0)?,
             parking_brake: AircraftVariable::from("BRAKE PARKING POSITION", "Bool", 1)?,
-            master_eng_1: AircraftVariable::from("TURB ENG MASTER STARTER SWITCH", "Bool", 2)?,
-            master_eng_2: AircraftVariable::from("TURB ENG MASTER STARTER SWITCH", "Bool", 2)?,
+            master_eng_1: AircraftVariable::from("GENERAL ENG STARTER ACTIVE", "Bool", 1)?,
+            master_eng_2: AircraftVariable::from("GENERAL ENG STARTER ACTIVE", "Bool", 2)?,
+            cargo_door_front_pos: AircraftVariable::from("EXIT OPEN","Percent",5)?,
+            cargo_door_back_pos: AircraftVariable::from("EXIT OPEN","Percent",3)?, //TODO It is the catering door for now
+            pushback_angle: AircraftVariable::from("PUSHBACK ANGLE","Radian",0)?,
+            pushback_state: AircraftVariable::from("PUSHBACK STATE","Enum",0)?,
         })
     }
 }
@@ -95,9 +103,13 @@ impl SimulatorReaderWriter for A320SimulatorReaderWriter {
             "AIRSPEED INDICATED" => self.airspeed_indicated.get(),
             "INDICATED ALTITUDE" => self.indicated_altitude.get(),
             "SIM ON GROUND" => self.sim_on_ground.get(),
-            "ENG_MASTER_1" => self.master_eng_1.get(),
-            "ENG_MASTER_2" => self.master_eng_2.get(),
+            "ENG MASTER 1" => self.master_eng_1.get(),
+            "ENG MASTER 2" => self.master_eng_2.get(),
             "PARK_BRAKE_ON" => self.parking_brake.get(),
+            "CARGO FRONT POS" => self.cargo_door_front_pos.get(),
+            "CARGO BACK POS" => self.cargo_door_back_pos.get(),
+            "PUSHBACK ANGLE" => self.pushback_angle.get(),
+            "PUSHBACK STATE" => self.pushback_state.get(),
             _ => {
                 lookup_named_variable(&mut self.dynamic_named_variables, "A32NX_", name).get_value()
             }
