@@ -5,6 +5,7 @@ use super::{
 use crate::{
     engine::Engine,
     overhead::FaultReleasePushButton,
+    shared::calculate_towards_target_temperature,
     simulation::{SimulationElement, SimulationElementVisitor, SimulatorWriter, UpdateContext},
 };
 use std::cmp::min;
@@ -57,11 +58,7 @@ impl ProvidePotential for EngineGenerator {
 
     fn potential_normal(&self) -> bool {
         // TODO: Replace with actual values once calculated.
-        if self.output_potential().is_powered() {
-            true
-        } else {
-            false
-        }
+        self.output_potential().is_powered()
     }
 }
 impl ProvideFrequency for EngineGenerator {
@@ -76,11 +73,7 @@ impl ProvideFrequency for EngineGenerator {
 
     fn frequency_normal(&self) -> bool {
         // TODO: Replace with actual values once calculated.
-        if self.output_potential().is_powered() {
-            true
-        } else {
-            false
-        }
+        self.output_potential().is_powered()
     }
 }
 impl ProvideLoad for EngineGenerator {
@@ -125,9 +118,12 @@ impl IntegratedDriveGenerator {
 
     fn new(number: usize) -> IntegratedDriveGenerator {
         IntegratedDriveGenerator {
-            oil_outlet_temperature_id: format!("ENG_GEN_{}_IDG_OIL_OUTLET_TEMPERATURE", number),
+            oil_outlet_temperature_id: format!(
+                "ELEC_ENG_GEN_{}_IDG_OIL_OUTLET_TEMPERATURE",
+                number
+            ),
             oil_outlet_temperature: ThermodynamicTemperature::new::<degree_celsius>(0.),
-            is_connected_id: format!("ENG_GEN_{}_IDG_IS_CONNECTED", number),
+            is_connected_id: format!("ELEC_ENG_GEN_{}_IDG_IS_CONNECTED", number),
             connected: true,
 
             time_above_threshold_in_milliseconds: 0,
@@ -191,21 +187,16 @@ impl IntegratedDriveGenerator {
         const IDG_HEATING_COEFFICIENT: f64 = 1.4;
         const IDG_COOLING_COEFFICIENT: f64 = 0.4;
 
-        let target_temperature = target.get::<degree_celsius>();
-        let mut temperature = self.oil_outlet_temperature.get::<degree_celsius>();
-        temperature += if temperature < target_temperature {
-            IDG_HEATING_COEFFICIENT * context.delta.as_secs_f64()
-        } else {
-            -(IDG_COOLING_COEFFICIENT * context.delta.as_secs_f64())
-        };
-
-        temperature = clamp(
-            temperature,
-            context.ambient_temperature.get::<degree_celsius>(),
-            target.get::<degree_celsius>(),
+        self.oil_outlet_temperature = calculate_towards_target_temperature(
+            self.oil_outlet_temperature,
+            target,
+            if self.oil_outlet_temperature < target {
+                IDG_HEATING_COEFFICIENT
+            } else {
+                IDG_COOLING_COEFFICIENT
+            },
+            context.delta,
         );
-
-        self.oil_outlet_temperature = ThermodynamicTemperature::new::<degree_celsius>(temperature);
     }
 
     fn get_target_temperature(
@@ -371,8 +362,8 @@ mod tests {
             idg.write(&mut writer);
 
             assert!(test_writer.len_is(2));
-            assert!(test_writer.contains_f64("ENG_GEN_1_IDG_OIL_OUTLET_TEMPERATURE", 0.));
-            assert!(test_writer.contains_bool("ENG_GEN_1_IDG_IS_CONNECTED", true));
+            assert!(test_writer.contains_f64("ELEC_ENG_GEN_1_IDG_OIL_OUTLET_TEMPERATURE", 0.));
+            assert!(test_writer.contains_bool("ELEC_ENG_GEN_1_IDG_IS_CONNECTED", true));
         }
 
         #[test]
