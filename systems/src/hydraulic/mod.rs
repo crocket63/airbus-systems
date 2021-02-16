@@ -332,7 +332,11 @@ pub struct HydLoop {
 impl HydLoop {
     const ACCUMULATOR_GAS_PRE_CHARGE: f64 =1885.0; // Nitrogen PSI
     const ACCUMULATOR_MAX_VOLUME: f64  =0.264; // in gallons
-    const HYDRAULIC_FLUID_DENSITY: f64 = 1000.55; // Exxon Hyjet IV, kg/m^3
+    //const HYDRAULIC_FLUID_DENSITY: f64 = 1000.55; // Exxon Hyjet IV, kg/m^3
+
+    //Low pass filter on pressure. This has to be pretty high not to modify behavior of the loop, but still dampening numerical instability
+    const PRESSURE_LOW_PASS_FILTER : f64 = 0.75;
+
     const ACCUMULATOR_PRESS_BREAKPTS: [f64; 9] = [
         0.0 ,5.0 , 10.0 ,50.0 ,100.0 ,200.0 ,500.0 ,1000.0 , 10000.0
     ];
@@ -437,19 +441,18 @@ impl HydLoop {
             delta_vol_max += p.get_delta_vol_max();
             delta_vol_min += p.get_delta_vol_min();
         }
-        // println!("----------START------");
-        // println!("---Current Press {}", pressure.get::<psi>());
-        // println!("---DELTA volMax {}", delta_vol_max.get::<gallon>());
+
+
         //Static leaks
         //TODO: separate static leaks per zone of high pressure or actuator
         //TODO: Use external pressure and/or reservoir pressure instead of 14.7 psi default
         let static_leaks_vol = Volume::new::<gallon>(0.04 * delta_time.as_secs_f64() * (self.loop_pressure.get::<psi>() - 14.7) / 3000.0);
-        // println!("---Leaks vol {}", static_leaks_vol.get::<gallon>());
+
         // Draw delta_vol from reservoir
         delta_vol -= static_leaks_vol;
         reservoir_return += static_leaks_vol;
 
-        //TODO PTU
+        //PTU flows handling
         let mut ptu_act = false;
         for ptu in ptus {
             let mut actualFlow = VolumeRate::new::<gallon_per_second>(0.0);
@@ -544,38 +547,31 @@ impl HydLoop {
 
         //How much we need to reach target of 3000?
         let mut volume_needed_to_reach_pressure_target = self.vol_to_target(Pressure::new::<psi>(3000.0));
-        // println!("---needed {}", volume_needed_to_reach_pressure_target.get::<gallon>());
         //Actually we need this PLUS what is used by consumers.
         volume_needed_to_reach_pressure_target -= delta_vol;
-        // println!("---neededFinal {}", volume_needed_to_reach_pressure_target.get::<gallon>());
 
         //Now computing what we will actually use from flow providers limited by
         //their min and max flows and reservoir availability
         let actual_volume_added_to_pressurise = self.reservoir_volume.min(delta_vol_min.max(delta_vol_max.min(volume_needed_to_reach_pressure_target)));
-        // println!("---actual vol added {}", actual_volume_added_to_pressurise.get::<gallon>());
         delta_vol+=actual_volume_added_to_pressurise;
-        // println!("---final delta vol {}", delta_vol.get::<gallon>());
 
         //Loop Pressure update From Bulk modulus
-        let pressDelta = self.delta_pressure_from_delta_volume(delta_vol);
-        // println!("---Press delta {}", pressDelta.get::<psi>());
-        self.loop_pressure += pressDelta; //Just ensuring we don't go in negative press
-        self.loop_pressure = self.loop_pressure.max(Pressure::new::<psi>(14.7));
-        // println!("---Final press {}", self.loop_pressure.get::<psi>());
+        let press_delta = self.delta_pressure_from_delta_volume(delta_vol);
+        let new_raw_press=self.loop_pressure + press_delta; //New raw pressure before we filter it
+
+        self.loop_pressure= HydLoop::PRESSURE_LOW_PASS_FILTER * new_raw_press + (1.-HydLoop::PRESSURE_LOW_PASS_FILTER) * self.loop_pressure;
+        self.loop_pressure = self.loop_pressure.max(Pressure::new::<psi>(14.7)); //Forcing a min pressure
 
 
         //Update reservoir
         self.reservoir_volume -= actual_volume_added_to_pressurise; //%limit to 0 min? for case of negative added?
         self.reservoir_volume += reservoir_return;
-        // println!("---Reservoir vol {}", self.reservoir_volume.get::<gallon>());
+
         //Update Volumes
         self.loop_volume += delta_vol;
-        // println!("---Total vol {} / {}", self.loop_volume.get::<gallon>(),self.max_loop_volume.get::<gallon>());
 
         self.current_delta_vol=delta_vol;
         self.current_flow=delta_vol / Time::new::<second>(delta_time.as_secs_f64());
-        // println!("---Final flow {}", self.current_flow.get::<gallon_per_second>());
-        // println!("---------END-------");
     }
 }
 
@@ -972,7 +968,7 @@ mod tests {
                 edp1.stop();
             }
             if x >= 500 { //Shutdown + 30s
-                assert!(green_loop.loop_pressure <= Pressure::new::<psi>(50.0));
+                assert!(green_loop.loop_pressure <= Pressure::new::<psi>(250.0));
             }
 
             edp1.update(&ct.delta,&ct, &green_loop, &engine1);
@@ -1096,7 +1092,7 @@ mod tests {
             }
 
             if x >= 600 { //X+200 after shutoff = X + 20seconds @ 100ms, so pressure shall be low
-                assert!(yellow_loop.loop_pressure <= Pressure::new::<psi>(100.0));
+                assert!(yellow_loop.loop_pressure <= Pressure::new::<psi>(200.0));
             }
             epump.update(&ct.delta,&ct, &yellow_loop);
             yellow_loop.update(&ct.delta,&ct, vec![&epump], Vec::new(), Vec::new(), Vec::new());
