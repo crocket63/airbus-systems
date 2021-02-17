@@ -239,8 +239,12 @@ pub struct Ptu {
 impl Ptu {
     //Low pass filter to handle flow dynamic: avoids instantaneous flow transient,
     // simulating RPM dynamic of PTU
-    const FLOW_DYNAMIC_LOW_PASS_LEFT_SIDE : f64 = 0.05;
-    const FLOW_DYNAMIC_LOW_PASS_RIGHT_SIDE : f64 = 0.05;
+    const FLOW_DYNAMIC_LOW_PASS_LEFT_SIDE : f64 = 0.1;
+    const FLOW_DYNAMIC_LOW_PASS_RIGHT_SIDE : f64 = 0.1;
+
+    //Part of the max total pump capacity PTU model is allowed to take. Set to 1 all capacity used
+    // set to 0.5 PTU will only use half of the flow that all pumps are able to generate
+    const AGRESSIVENESS_FACTOR : f64 = 0.6;
 
     pub fn new() -> Ptu {
         Ptu{
@@ -266,6 +270,10 @@ impl Ptu {
             if self.isActiveLeft || (!self.isActiveRight && deltaP.get::<psi>()  > 500.0) {//Left sends flow to right
                 let mut vr = 16.0f64.min(loopLeft.loop_pressure.get::<psi>() * 0.0058) / 60.0;
 
+                //Limiting available flow with maximum flow capacity of all pumps of the loop.
+                //This is a workaround to limit PTU greed for flow
+                vr=vr.min(loopLeft.current_max_flow.get::<gallon_per_second>()*Ptu::AGRESSIVENESS_FACTOR);
+
                 //Low pass on flow
                 vr = Ptu::FLOW_DYNAMIC_LOW_PASS_LEFT_SIDE * vr
                 + (1.0-Ptu::FLOW_DYNAMIC_LOW_PASS_LEFT_SIDE) * self.last_flow.get::<gallon_per_second>();
@@ -277,6 +285,10 @@ impl Ptu {
                 self.isActiveLeft=true;
             } else if self.isActiveRight || (!self.isActiveLeft && deltaP.get::<psi>()  < -500.0) {//Right sends flow to left
                 let mut vr = 34.0f64.min(loopRight.loop_pressure.get::<psi>() * 0.0125) / 60.0;
+
+                //Limiting available flow with maximum flow capacity of all pumps of the loop.
+                //This is a workaround to limit PTU greed for flow
+                vr=vr.min(loopRight.current_max_flow.get::<gallon_per_second>()*Ptu::AGRESSIVENESS_FACTOR);
 
                 //Low pass on flow
                 vr = Ptu::FLOW_DYNAMIC_LOW_PASS_RIGHT_SIDE * vr
@@ -290,10 +302,10 @@ impl Ptu {
             }
 
             //TODO REVIEW DEACTICATION LOGIC
-            if  self.isActiveRight && loopLeft.loop_pressure.get::<psi>()  > 2980.0
-             || self.isActiveLeft && loopRight.loop_pressure.get::<psi>() > 2980.0
-             || self.isActiveRight && loopRight.loop_pressure.get::<psi>()  < 200.0
-             || self.isActiveLeft && loopLeft.loop_pressure.get::<psi>()  < 200.0
+            if  self.isActiveRight && loopLeft.loop_pressure.get::<psi>()  > 3001.0
+             || self.isActiveLeft && loopRight.loop_pressure.get::<psi>() > 3001.0
+             || self.isActiveRight && loopRight.loop_pressure.get::<psi>()  < 500.0
+             || self.isActiveLeft && loopLeft.loop_pressure.get::<psi>()  < 500.0
              {
                 self.flow_to_left=VolumeRate::new::<gallon_per_second>(0.0);
                 self.flow_to_right=VolumeRate::new::<gallon_per_second>(0.0);
@@ -327,6 +339,7 @@ pub struct HydLoop {
     reservoir_volume: Volume,
     current_delta_vol: Volume,
     current_flow: VolumeRate,
+    current_max_flow : VolumeRate, //Current total max flow available from pressure sources
 }
 
 impl HydLoop {
@@ -336,6 +349,8 @@ impl HydLoop {
 
     //Low pass filter on pressure. This has to be pretty high not to modify behavior of the loop, but still dampening numerical instability
     const PRESSURE_LOW_PASS_FILTER : f64 = 0.75;
+
+    const DELTA_VOL_LOW_PASS_FILTER : f64 = 0.1;
 
     const ACCUMULATOR_PRESS_BREAKPTS: [f64; 9] = [
         0.0 ,5.0 , 10.0 ,50.0 ,100.0 ,200.0 ,500.0 ,1000.0 , 10000.0
@@ -372,6 +387,7 @@ impl HydLoop {
             current_flow: VolumeRate::new::<gallon_per_second>(0.),
             accumulator_press_breakpoints:HydLoop::ACCUMULATOR_PRESS_BREAKPTS,
             accumulator_flow_carac:HydLoop::ACCUMULATOR_FLOW_CARAC,
+            current_max_flow: VolumeRate::new::<gallon_per_second>(0.),
         }
     }
 
@@ -442,6 +458,8 @@ impl HydLoop {
             delta_vol_min += p.get_delta_vol_min();
         }
 
+        //Storing max pump capacity available. for now used in PTU model to limit it's input flow
+        self.current_max_flow = delta_vol_max / Time::new::<second>(delta_time.as_secs_f64());
 
         //Static leaks
         //TODO: separate static leaks per zone of high pressure or actuator
@@ -568,6 +586,9 @@ impl HydLoop {
         self.reservoir_volume += reservoir_return;
 
         //Update Volumes
+
+        //Low pass filter on final delta vol to help with stability and final flow noise
+        delta_vol = HydLoop::DELTA_VOL_LOW_PASS_FILTER * delta_vol + (1.-HydLoop::DELTA_VOL_LOW_PASS_FILTER ) * self.current_delta_vol;
         self.loop_volume += delta_vol;
 
         self.current_delta_vol=delta_vol;
@@ -1230,14 +1251,14 @@ mod tests {
 
             if x == 300 { //@30s, ptu should be supplying green loop
                 println!("----------PTU SUPPLIES GREEN------------");
-               assert!(yellow_loop.loop_pressure >= Pressure::new::<psi>(2400.0));
-               assert!(green_loop.loop_pressure >= Pressure::new::<psi>(2400.0));
+                assert!(yellow_loop.loop_pressure >= Pressure::new::<psi>(2400.0));
+                assert!(green_loop.loop_pressure >= Pressure::new::<psi>(2400.0));
             }
 
             if x == 400 { //@40s enabling edp
                 println!("------------GREEN  EDP1  ON------------");
-               assert!(yellow_loop.loop_pressure >= Pressure::new::<psi>(2400.0));
-               assert!(green_loop.loop_pressure >= Pressure::new::<psi>(2400.0));
+               assert!(yellow_loop.loop_pressure >= Pressure::new::<psi>(2600.0));
+               assert!(green_loop.loop_pressure >= Pressure::new::<psi>(2000.0));
                 edp1.start();
             }
 
